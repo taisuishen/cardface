@@ -1,5 +1,18 @@
+# 本地 / CPU 部署用。
+#
+# 本地实测通过的组合（Windows, Python 3.13.5）：
+#   numpy 2.4.6  opencv 4.13.0  onnxruntime 1.28.0
+#   fastapi 0.141.1  uvicorn 0.52.0  websockets 17.0.1
+#
+# 装完自检： python server/selftest.py
+
 fastapi>=0.115
 uvicorn[standard]>=0.30
-numpy>=1.26
-opencv-python-headless>=4.9
-onnxruntime>=1.18
+websockets>=12                  # ws_client_test.py 直接 import，别只靠 uvicorn[standard] 传递
+numpy>=1.26,<3
+onnxruntime>=1.18               # CPU 版没有 CUDA 版本对应问题，不用锁上限
+
+# OpenCV 必须锁在 4.x：5.0 是大版本，YuNet(FaceDetectorYN) 和 cv2.dnn.NMSBoxes
+# 的行为都没在本项目验证过，实测 5.0.0.93 会打印
+#   "Targets are not supported by the new graph engine for now"
+opencv-python-headless>=4.9,<5

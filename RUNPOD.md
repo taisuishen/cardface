@@ -70,12 +70,38 @@ pip install -r server/requirements-gpu.txt
 
 ### 4. 确认 GPU 真的被用上了
 
+> **别用 `ort.get_available_providers()` 判断。** 它列的是**编译时**支持的 provider，
+> 即使运行时 CUDA 动态库加载失败、实际跑在 CPU 上，它照样会打印
+> `['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']`。
+
+真正能确认的是**能不能建出 session**：
+
 ```bash
-python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+python -c "
+import onnxruntime as ort
+s = ort.InferenceSession('cardpose.onnx', providers=['CUDAExecutionProvider'])
+print('实际生效:', s.get_providers())"
 ```
 
-**必须能看到 `CUDAExecutionProvider`。** 只看到 CPU 的话：
+或者直接看服务启动日志里的这一行 —— 这是最终判据：
 
+```
+[init] card providers=['CUDAExecutionProvider', 'CPUExecutionProvider']   # 对
+[init] card providers=['CPUExecutionProvider']                            # 没用上 GPU
+```
+
+只看到 CPU 的话，按这个顺序查：
+
+- **`libcublasLt.so.13: cannot open shared object file`**（最常见）
+  → 装了 CUDA 13 版的 ORT，但镜像是 CUDA 12。ORT **1.27 起** PyPI 的 GPU wheel
+  默认按 CUDA 13 构建，最后一个 CUDA 12 版本是 1.26.x：
+
+  ```bash
+  pip uninstall -y onnxruntime-gpu && pip install "onnxruntime-gpu<1.27"
+  ```
+
+  反之如果 `nvidia-smi` 显示 CUDA 13.x，那就要装 `onnxruntime-gpu>=1.27`。
+  用 `nvidia-smi` 右上角的 CUDA Version 对一下再选。
 - 忘了 `pip uninstall onnxruntime` → 卸干净重装 `onnxruntime-gpu`
 - `nvidia-smi` 看不到卡 → Pod 没分到 GPU，重开
 - cuDNN 版本不匹配 → 换 `nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04` 基础镜像（方式 B）

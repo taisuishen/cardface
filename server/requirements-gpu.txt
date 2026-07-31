@@ -1,7 +1,39 @@
-# RunPod (GPU) 用。onnxruntime-gpu 需要容器里有 CUDA 12 + cuDNN 9，
-# 用 Dockerfile 里的 nvidia/cuda:*-cudnn-runtime 或 pytorch cuda 镜像即可。
+# RunPod / GPU 部署用。
+#
+# ============================ 先确认 CUDA 大版本 ============================
+# onnxruntime-gpu 的 wheel 是按 CUDA 大版本编译的，装错了不会报错退出，
+# 而是【静默退回 CPU】—— 这是本项目踩过的坑，务必先对版本：
+#
+#     nvidia-smi        # 看右上角 CUDA Version
+#
+#   CUDA 12.x  ->  用下面默认的 onnxruntime-gpu>=1.22,<1.27
+#   CUDA 13.x  ->  把那行改成 onnxruntime-gpu>=1.27
+#
+# 为什么要锁 <1.27：ORT 从 1.27 起，PyPI 上的 GPU wheel 默认按 CUDA 13 构建。
+# 在 CUDA 12 镜像（只有 libcublasLt.so.12）里装 1.27+ 会报：
+#     Failed to load library ..._providers_cuda.so:
+#     libcublasLt.so.13: cannot open shared object file
+# 最后一个 CUDA 12 版本是 1.26.x。
+#
+# ============================ 怎么验证真的用上 GPU ==========================
+# 不要用 ort.get_available_providers() 判断 —— 它列的是【编译时】支持的 provider，
+# 即使运行时加载失败、实际跑在 CPU 上，它照样会打印 CUDAExecutionProvider。
+# 唯一可信的是服务启动日志里这一行：
+#     [init] card providers=['CUDAExecutionProvider', 'CPUExecutionProvider']   # 对
+#     [init] card providers=['CPUExecutionProvider']                           # 没用上
+# 首次启动会慢（CUDA/cuDNN 初始化 + 预热推理，实测约 80s），之后不影响每帧耗时。
+#
+# 另外：装 GPU 版之前一定要 pip uninstall -y onnxruntime，
+# CPU 版和 GPU 版不能共存，否则会优先加载到 CPU 版。
+# ==========================================================================
+
 fastapi>=0.115
 uvicorn[standard]>=0.30
-numpy>=1.26
-opencv-python-headless>=4.9
-onnxruntime-gpu>=1.18
+websockets>=12                  # ws_client_test.py 直接 import，别只靠 uvicorn[standard] 传递
+numpy>=1.26,<3
+onnxruntime-gpu>=1.22,<1.27     # CUDA 12 专用；CUDA 13 镜像请改成 >=1.27
+
+# OpenCV 必须锁在 4.x：5.0 是大版本，YuNet(FaceDetectorYN) 和 cv2.dnn.NMSBoxes
+# 的行为都没在本项目验证过。实测 RunPod 上装到 5.0.0.93 会打印
+#   "Targets are not supported by the new graph engine for now"
+opencv-python-headless>=4.9,<5
