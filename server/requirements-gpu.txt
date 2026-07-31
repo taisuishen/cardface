@@ -1,0 +1,7 @@
+# RunPod (GPU) 用。onnxruntime-gpu 需要容器里有 CUDA 12 + cuDNN 9，
+# 用 Dockerfile 里的 nvidia/cuda:*-cudnn-runtime 或 pytorch cuda 镜像即可。
+fastapi>=0.115
+uvicorn[standard]>=0.30
+numpy>=1.26
+opencv-python-headless>=4.9
+onnxruntime-gpu>=1.18

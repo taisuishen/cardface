@@ -1,0 +1,8 @@
+certs/
+selftest_out/
+__pycache__/
+*/__pycache__/
+*.pyc
+.git/
+*.md
+run_local.ps1

@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>证件 / 人脸识别</title>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;background:#0d1117;color:#e6edf3;font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+       padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+  header{display:flex;align-items:center;gap:8px;padding:10px 12px;background:#161b22;border-bottom:1px solid #30363d;
+         position:sticky;top:0;z-index:20}
+  header b{font-size:15px}
+  #dot{width:9px;height:9px;border-radius:50%;background:#f85149;flex:none;transition:background .2s}
+  #dot.on{background:#3fb950}
+  .tabs{display:flex;margin-left:auto;background:#0d1117;border:1px solid #30363d;border-radius:8px;overflow:hidden}
+  .tabs button{background:none;border:0;color:#8b949e;padding:6px 14px;font-size:14px;font-family:inherit}
+  .tabs button.act{background:#1f6feb;color:#fff}
+
+  #stage{position:relative;width:100%;background:#000;overflow:hidden}
+  video,#ov{position:absolute;inset:0;width:100%;height:100%}
+  video{object-fit:cover}
+  #ov{pointer-events:none}
+  #banner{position:absolute;left:0;right:0;bottom:0;padding:14px 12px;font-size:17px;font-weight:600;text-align:center;
+          background:linear-gradient(transparent,rgba(0,0,0,.85));text-shadow:0 1px 3px #000}
+  #banner.ok{color:#3fb950}#banner.bad{color:#ffa657}#banner.wait{color:#e6edf3}
+
+  .panel{padding:12px}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .btn{flex:1;min-width:110px;padding:11px;border-radius:8px;border:1px solid #30363d;background:#21262d;color:#e6edf3;
+       font-size:14px;font-family:inherit}
+  .btn.pri{background:#238636;border-color:#2ea043;font-weight:600}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:10px;margin-bottom:10px}
+  .card h3{margin:0 0 8px;font-size:13px;color:#8b949e;font-weight:600}
+  #shot{width:100%;border-radius:6px;display:none;background:#000}
+  #empty{color:#484f58;font-size:13px;text-align:center;padding:22px 0}
+  table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
+  td{padding:3px 0;border-bottom:1px solid #21262d}
+  td:first-child{color:#8b949e;width:42%}
+  td:last-child{text-align:right;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  #err{display:none;margin:12px;padding:12px;border-radius:8px;background:#3d1d1d;border:1px solid #f85149;color:#ffa198;font-size:13px}
+  #err code{background:#00000055;padding:1px 4px;border-radius:3px;word-break:break-all}
+</style>
+</head>
+<body>
+
+<header>
+  <span id="dot"></span><b>证件 / 人脸识别</b>
+  <div class="tabs">
+    <button id="tabCard" class="act">证件</button>
+    <button id="tabFace">人脸</button>
+  </div>
+</header>
+
+<div id="err"></div>
+
+<div id="stage">
+  <video id="v" playsinline autoplay muted></video>
+  <canvas id="ov"></canvas>
+  <div id="banner" class="wait">点击下方「开始」</div>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <button id="btnStart" class="btn pri">开始</button>
+    <button id="btnStop" class="btn">停止</button>
+    <button id="btnCam" class="btn">前/后切换</button>
+  </div>
+  <div class="row">
+    <select id="camSel" class="btn"><option value="">摄像头：自动</option></select>
+    <button id="btnRec" class="btn">录 50 帧供排查</button>
+  </div>
+
+  <div class="card">
+    <h3>服务端回传的结果图</h3>
+    <img id="shot" alt="result">
+    <div id="empty">合格时这里显示矫正后的证件 / 人脸裁图</div>
+  </div>
+
+  <div class="card">
+    <h3>实时状态</h3>
+    <table>
+      <tr><td>连接</td><td id="sWs">未连接</td></tr>
+      <tr><td>模式</td><td id="sMode">card</td></tr>
+      <tr><td>发送帧率 / 丢帧</td><td id="sFps">-</td></tr>
+      <tr><td>上传大小</td><td id="sSize">-</td></tr>
+      <tr><td>服务端耗时</td><td id="sMs">-</td></tr>
+      <tr><td>往返延迟</td><td id="sRtt">-</td></tr>
+      <tr><td>判定</td><td id="sReason">-</td></tr>
+      <tr><td>置信度</td><td id="sConf">-</td></tr>
+      <tr><td>旋转角 / 倾斜</td><td id="sGeo">-</td></tr>
+      <tr><td>推理后端</td><td id="sBk">-</td></tr>
+      <tr><td>当前摄像头</td><td id="sCam">-</td></tr>
+      <tr><td>角点抖动 / 投票</td><td id="sJit">-</td></tr>
+    </table>
+  </div>
+</div>
+
+<script>
+const FPS         = 3;            // 每秒发送帧数
+const TARGET_KB   = 100;          // 目标单帧大小
+const LONG_SIDE   = 960;          // 上传图长边（与模型输入一致）
+const MAX_INFLIGHT= 1;            // 未收到结果时最多在途帧数（背压）
+const STALL_MS    = 4000;         // 超过这么久没收到结果就放弃等待，继续发新帧
+
+const $ = id => document.getElementById(id);
+const v = $('v'), ov = $('ov'), ctx = ov.getContext('2d');
+const cap = document.createElement('canvas'), cctx = cap.getContext('2d');
+
+let ws = null, stream = null, timer = null, pingTimer = null;
+let mode = 'card', facing = 'environment', deviceId = '';   // deviceId 为空 = 按 facing 自动选
+let quality = 0.7, inflight = 0, sent = 0, dropped = 0, lastSentAt = 0;
+let last = null;   // 最近一次结果，用于画框
+let viewW = 0, viewH = 0;   // 取景区的 CSS 像素尺寸（画框坐标就用这个坐标系）
+
+/* ---------------- 布局：让取景区保持视频比例 ---------------- */
+function layout(){
+  const w = $('stage').clientWidth;
+  const ar = (v.videoWidth && v.videoHeight) ? v.videoHeight / v.videoWidth : 3/4;
+  const h = Math.min(Math.round(w * ar), Math.round(window.innerHeight * 0.62));
+  $('stage').style.height = h + 'px';
+  viewW = w; viewH = h;
+  // 画布按设备像素比放大，避免高分屏上线条发虚；再用 setTransform 把绘图
+  // 坐标系还原成 CSS 像素，这样下面所有映射都只跟 viewW/viewH 打交道。
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  ov.width = Math.round(w * dpr);
+  ov.height = Math.round(h * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (last) draw(last);
+}
+addEventListener('resize', layout);
+v.addEventListener('loadedmetadata', layout);
+
+/* ---------------- 摄像头 ---------------- */
+async function openCam(){
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    showErr('这个浏览器上下文拿不到摄像头。<br>手机访问必须是 <b>HTTPS</b> 或 <code>localhost</code>。'
+      + '请用启动脚本给出的 <code>https://…</code> 地址打开本页，并信任自签证书。');
+    return false;
+  }
+  stop();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  // 指定了 deviceId 就用它（exact，选错不如报错），否则按前置/后置让浏览器挑
+  const vid = deviceId
+    ? { deviceId:{exact:deviceId}, width:{ideal:1280}, height:{ideal:960} }
+    : { facingMode:{ideal:facing}, width:{ideal:1280}, height:{ideal:960} };
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({ video: vid, audio:false });
+  }catch(e){
+    if (deviceId){          // 这个摄像头打不开就退回自动，不要卡死
+      deviceId = '';
+      return openCam();
+    }
+    showErr('打开摄像头失败：<code>' + e.name + ' ' + e.message + '</code>'
+      + '<br>请检查浏览器是否已授予相机权限。');
+    return false;
+  }
+  v.srcObject = stream;
+  await v.play().catch(()=>{});
+  layout();
+  hideErr();
+  await listCams();
+  return true;
+}
+
+/* 枚举摄像头。注意：只有拿到权限后 label 才有内容，所以要在 openCam 成功之后调用。 */
+async function listCams(){
+  const sel = $('camSel');
+  let ds = [];
+  try{
+    ds = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  }catch(e){ return; }
+
+  const cur = stream && stream.getVideoTracks()[0];
+  const curId = cur && cur.getSettings ? cur.getSettings().deviceId : '';
+  sel.innerHTML = '';
+  const auto = new Option('摄像头：自动（' + (facing === 'user' ? '前置' : '后置') + '）', '');
+  sel.appendChild(auto);
+  ds.forEach((d, i) => {
+    const o = new Option(d.label || ('摄像头 ' + (i + 1)), d.deviceId);
+    sel.appendChild(o);
+  });
+  sel.value = deviceId && ds.some(d => d.deviceId === deviceId) ? deviceId : '';
+
+  const st = cur && cur.getSettings ? cur.getSettings() : {};
+  $('sCam').textContent = (cur ? (cur.label || '未命名') : '-')
+    + (st.width ? '  ' + st.width + '×' + st.height : '');
+  // 自动档时也把当前实际用的设备高亮出来，方便知道系统选了哪一个
+  if (!deviceId && curId){
+    const hit = [...sel.options].find(o => o.value === curId);
+    if (hit) hit.textContent = '▸ ' + hit.textContent;
+  }
+}
+
+function showErr(html){ $('err').innerHTML = html; $('err').style.display = 'block'; }
+function hideErr(){ $('err').style.display = 'none'; }
+
+/* ---------------- WebSocket ---------------- */
+function connect(){
+  return new Promise(res => {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(proto + '://' + location.host + '/ws');
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {
+      $('dot').classList.add('on'); $('sWs').textContent = '已连接';
+      ws.send(JSON.stringify({type:'config', mode}));
+      // 保活：RunPod 等反向代理会掐掉空闲连接，停止推流时也要有心跳
+      clearInterval(pingTimer);
+      pingTimer = setInterval(() => {
+        if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'ping'}));
+      }, 20000);
+      res(true);
+    };
+    ws.onclose = () => {
+      $('dot').classList.remove('on'); $('sWs').textContent = '已断开';
+      clearInterval(pingTimer); stop(); res(false);
+    };
+    ws.onerror = () => { $('sWs').textContent = '连接错误'; };
+    ws.onmessage = e => onMsg(JSON.parse(e.data));
+  });
+}
+
+function onMsg(m){
+  if (m.type === 'hello'){
+    $('sBk').textContent = (m.card_providers||[]).join(',').replace(/ExecutionProvider/g,'')
+                          + ' / ' + m.face_backend;
+    return;
+  }
+  if (m.type === 'config_ok'){ $('sMode').textContent = m.mode; return; }
+  if (m.type === 'record_started'){ banner('正在录制 ' + m.n + ' 帧…', 'wait'); return; }
+  if (m.type === 'error'){
+    inflight = Math.max(0, inflight-1);
+    banner('服务端错误：' + m.msg, 'bad');
+    return;
+  }
+  if (m.type !== 'result') return;
+
+  inflight = Math.max(0, inflight-1);
+  last = m;
+  dropped += (m.dropped || 0);
+
+  $('sMs').textContent    = m.ms + ' ms';
+  $('sRtt').textContent   = (performance.now() - lastSentAt).toFixed(0) + ' ms';
+  $('sReason').textContent= m.reason;
+  $('sConf').textContent  = (m.conf ?? '-');
+  $('sSize').textContent  = (m.bytes_in/1024).toFixed(0) + ' KB @ '
+                          + m.frame_size[0] + '×' + m.frame_size[1];
+  $('sJit').textContent = m.mode === 'card'
+      ? (m.jitter != null ? m.jitter + ' px' : '-') + ' / ' + (m.votes || '-')
+        + (m.held ? '  (漏检沿用上帧)' : '')
+      : '-';
+  if (m.rec_done) banner('录制完成：' + m.rec_done, 'ok');
+  $('sGeo').textContent = m.mode === 'card'
+      ? (m.rotate_deg ?? '-') + '° / ' + (m.skew ?? '-')
+      : 'roll ' + (m.roll_deg ?? '-') + '° / yaw ' + (m.yaw_ratio ?? '-');
+
+  banner(m.msg + (m.stable && !m.ok ? '  ' + m.stable : ''), m.ok ? 'ok' : (m.reason==='unstable'?'wait':'bad'));
+
+  if (m.ok && m.image){
+    $('shot').src = m.image; $('shot').style.display = 'block'; $('empty').style.display = 'none';
+  }
+  draw(m);
+}
+
+function banner(text, cls){ const b = $('banner'); b.textContent = text; b.className = cls; }
+
+/* ---------------- 叠加绘制 ---------------- */
+function draw(m){
+  ctx.clearRect(0,0,viewW,viewH);
+  // 关键：服务端返回的坐标属于"上传帧"坐标系（grab() 里把长边缩到 LONG_SIDE，
+  // 例如 960×720），不是 video.videoWidth（1280×960）。用 videoWidth 换算会让框
+  // 整体缩小并偏向左上角，所以这里必须用服务端回传的 frame_size。
+  const fw = m.frame_size && m.frame_size[0], fh = m.frame_size && m.frame_size[1];
+  if (!fw || !fh) return;
+  // video 是 object-fit:cover，按同样规则（等比放大到铺满 + 居中裁切）映射
+  const s = Math.max(viewW/fw, viewH/fh);
+  const ox = (viewW - fw*s)/2, oy = (viewH - fh*s)/2;
+  const P = (x,y) => [x*s+ox, y*s+oy];
+
+  ctx.lineWidth = 3; ctx.strokeStyle = m.ok ? '#3fb950' : '#ffa657';
+
+  if (m.mode === 'card' && m.quad && m.quad.length === 4){
+    ctx.beginPath();
+    m.quad.forEach((p,i)=>{ const [x,y]=P(p[0],p[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+    ctx.closePath(); ctx.stroke();
+    ctx.fillStyle = ctx.strokeStyle;
+    m.quad.forEach((p,i)=>{ const [x,y]=P(p[0],p[1]);
+      ctx.beginPath(); ctx.arc(x,y,5,0,7); ctx.fill();
+      ctx.font='bold 13px monospace'; ctx.fillText(['TL','TR','BR','BL'][i], x+8, y-8); });
+  }
+  if (m.mode === 'face' && m.box && m.box.length === 4){
+    const [x,y,w,h] = m.box, [px,py] = P(x,y), [qx,qy] = P(x+w,y+h);
+    ctx.strokeRect(px,py,qx-px,qy-py);
+    ctx.fillStyle = ctx.strokeStyle;
+    (m.landmarks||[]).forEach(p=>{ const [a,b]=P(p[0],p[1]);
+      ctx.beginPath(); ctx.arc(a,b,3,0,7); ctx.fill(); });
+  }
+}
+
+/* ---------------- 采集 + 自适应压到 ~100KB ---------------- */
+function grab(){
+  const vw = v.videoWidth, vh = v.videoHeight;
+  if (!vw) return null;
+  const s = LONG_SIDE / Math.max(vw,vh);
+  cap.width  = Math.round(vw*s);
+  cap.height = Math.round(vh*s);
+  cctx.drawImage(v, 0, 0, cap.width, cap.height);
+  return new Promise(r => cap.toBlob(r, 'image/jpeg', quality));
+}
+
+async function tick(){
+  if (!ws || ws.readyState !== 1) return;
+
+  // 看门狗：万一某帧的结果没回来（服务端异常/丢包），inflight 会一直卡住
+  // 导致后面再也不发帧。超过 STALL_MS 没收到结果就强制放行。
+  if (inflight > 0 && lastSentAt && performance.now() - lastSentAt > STALL_MS){
+    inflight = 0;
+    banner('响应超时，重试中…', 'bad');
+  }
+  if (inflight >= MAX_INFLIGHT){ dropped++; $('sFps').textContent = fpsText(); return; }
+
+  const blob = await grab();
+  if (!blob) return;
+
+  // 反馈式调整质量，让每帧稳定在 TARGET_KB 附近
+  const kb = blob.size/1024;
+  if (kb > TARGET_KB*1.15)      quality = Math.max(0.35, quality - 0.05);
+  else if (kb < TARGET_KB*0.75) quality = Math.min(0.92, quality + 0.04);
+
+  ws.send(await blob.arrayBuffer());
+  inflight++; sent++; lastSentAt = performance.now();
+  $('sFps').textContent = fpsText();
+}
+
+let t0 = 0;
+function fpsText(){
+  const dt = (performance.now() - t0)/1000;
+  return (sent/Math.max(dt,.001)).toFixed(1) + ' fps / 丢 ' + dropped;
+}
+
+/* ---------------- 控制 ---------------- */
+async function start(){
+  if (!stream && !(await openCam())) return;
+  if (!ws || ws.readyState > 1) { if (!(await connect())) return; }
+  sent = 0; dropped = 0; t0 = performance.now(); inflight = 0;
+  clearInterval(timer);
+  timer = setInterval(tick, 1000/FPS);
+  banner('识别中…', 'wait');
+}
+function stop(){ clearInterval(timer); timer = null; inflight = 0; }
+
+$('btnStart').onclick = start;
+$('btnStop').onclick  = () => { stop(); banner('已停止', 'wait'); };
+$('btnCam').onclick   = async () => {
+  facing = facing === 'environment' ? 'user' : 'environment';
+  deviceId = '';                      // 回到自动档，交给浏览器按前/后置挑
+  const run = !!timer; stop();
+  if (await openCam() && run) start();
+};
+
+// 录制真机帧：出问题时点一下，服务端会把原始上传帧+判定结果存到 dumps/，
+// 之后可以用 tools/analyze_dump.py 离线复现，不用靠猜。
+$('btnRec').onclick = () => {
+  if (!ws || ws.readyState !== 1){ banner('请先点「开始」建立连接', 'bad'); return; }
+  ws.send(JSON.stringify({type:'record', n:50}));
+};
+
+// 手动选摄像头（很多手机后置有主摄/广角/长焦多颗，自动档不一定挑到清晰的那颗）
+$('camSel').onchange = async () => {
+  deviceId = $('camSel').value;
+  const run = !!timer; stop();
+  if (await openCam() && run) start();
+};
+
+function setMode(m){
+  mode = m;
+  $('tabCard').classList.toggle('act', m==='card');
+  $('tabFace').classList.toggle('act', m==='face');
+  $('sMode').textContent = m;
+  $('shot').style.display='none'; $('empty').style.display='block';
+  last = null;
+  ctx.clearRect(0,0,viewW,viewH);
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'config', mode:m}));
+  // 证件用后置、人脸用前置，更符合实际使用。
+  // 但如果用户已经手动指定了摄像头，就尊重用户的选择，不再自动切。
+  const want = m === 'card' ? 'environment' : 'user';
+  if (!deviceId && want !== facing){
+    facing = want; const run = !!timer; stop();
+    openCam().then(o => { if (o && run) start(); });
+  }
+}
+$('tabCard').onclick = () => setMode('card');
+$('tabFace').onclick = () => setMode('face');
+
+// 页面切到后台时（切 App / 锁屏），浏览器会把 setInterval 限流到 1 秒一次，
+// 摄像头帧也会停。这时干脆停掉推流，回到前台再恢复，省流量也免得出现假卡顿。
+let wasRunning = false;
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden){
+    wasRunning = !!timer;
+    if (wasRunning){ stop(); banner('已暂停（页面在后台）', 'wait'); }
+  } else if (wasRunning){
+    wasRunning = false;
+    start();
+  }
+});
+
+layout();
+if (!window.isSecureContext && location.hostname !== 'localhost'){
+  showErr('当前是非安全上下文（<code>' + location.protocol + '</code>），手机浏览器会禁止访问摄像头。'
+        + '<br>请改用 <code>https://…</code> 地址打开。');
+}
+</script>
+</body>
+</html>

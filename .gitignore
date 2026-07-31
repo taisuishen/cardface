@@ -1,0 +1,6 @@
+certs/
+selftest_out/
+testdata/
+__pycache__/
+*.pyc
+app.log
