@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 from dataclasses import dataclass, field
 
 import cv2
@@ -57,40 +58,72 @@ class FaceResult:
 
 
 class FaceDetector:
+    """线程安全的人脸检测器。
+
+    重要：cv2.FaceDetectorYN 和 cv2.CascadeClassifier 的实例都【不是线程安全的】。
+    实测（8 线程并发调用同一个 FaceDetectorYN 实例，即使输入尺寸完全相同）会在
+    OpenCV 原生层直接崩溃，连 Python traceback 都没有，整个服务进程一起挂掉。
+    而单线程跑同样的负载完全正常。
+
+    本服务里 FaceDetector 是全局单例、被 run_in_executor 的线程池并发调用，
+    所以这里用 threading.local() 给每个工作线程各自持有一份实例。
+    模型只有 232KB，线程池上限 min(32, cpu+4)，多占几 MB 换来无锁并行是值得的。
+    """
+
     def __init__(self, model_dir: str = "models", rule: FaceRule | None = None):
         self.rule = rule or FaceRule()
-        self.backend = "haar"
-        self._yunet = None
-        self._yunet_size = (0, 0)
+        self._local = threading.local()
 
+        # 先在主线程试建一次，确定用哪个后端、并让加载失败在启动时就暴露
+        self._yunet_path: str | None = None
         for name in YUNET_FILES:
             p = os.path.join(model_dir, name)
             if os.path.exists(p):
                 try:
-                    self._yunet = cv2.FaceDetectorYN.create(
+                    cv2.FaceDetectorYN.create(
                         p, "", (320, 320),
                         score_threshold=self.rule.conf_thres, nms_threshold=0.3, top_k=50,
                     )
-                    self.backend = "yunet"
+                    self._yunet_path = p
                     break
                 except cv2.error:
-                    self._yunet = None
+                    self._yunet_path = None
 
-        if self._yunet is None:
-            xml = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
-            self._haar = cv2.CascadeClassifier(xml)
-            if self._haar.empty():
-                raise RuntimeError("Haar cascade 加载失败")
+        self.backend = "yunet" if self._yunet_path else "haar"
+        self._haar_xml = os.path.join(cv2.data.haarcascades,
+                                      "haarcascade_frontalface_default.xml")
+        if self.backend == "haar" and cv2.CascadeClassifier(self._haar_xml).empty():
+            raise RuntimeError("Haar cascade 加载失败")
+
+    # ---------- 每线程各持一份检测器 ----------
+    def _yunet(self):
+        d = getattr(self._local, "yunet", None)
+        if d is None:
+            d = cv2.FaceDetectorYN.create(
+                self._yunet_path, "", (320, 320),
+                score_threshold=self.rule.conf_thres, nms_threshold=0.3, top_k=50,
+            )
+            self._local.yunet = d
+            self._local.size = (0, 0)
+        return d
+
+    def _haar(self):
+        d = getattr(self._local, "haar", None)
+        if d is None:
+            d = cv2.CascadeClassifier(self._haar_xml)
+            self._local.haar = d
+        return d
 
     # ---------- 原始检测 ----------
     def _detect(self, bgr: np.ndarray):
         """返回 [(x, y, w, h, score, landmarks_or_None), ...]"""
         H, W = bgr.shape[:2]
         if self.backend == "yunet":
-            if self._yunet_size != (W, H):
-                self._yunet.setInputSize((W, H))
-                self._yunet_size = (W, H)
-            _, faces = self._yunet.detect(bgr)
+            det = self._yunet()
+            if getattr(self._local, "size", None) != (W, H):
+                det.setInputSize((W, H))
+                self._local.size = (W, H)
+            _, faces = det.detect(bgr)
             if faces is None:
                 return []
             out = []
@@ -104,7 +137,7 @@ class FaceDetector:
 
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
-        rects = self._haar.detectMultiScale(
+        rects = self._haar().detectMultiScale(
             gray, scaleFactor=1.1, minNeighbors=5,
             minSize=(int(min(W, H) * 0.12), int(min(W, H) * 0.12)),
         )
