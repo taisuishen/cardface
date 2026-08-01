@@ -138,7 +138,7 @@ let mode = 'card', facing = 'environment', deviceId = '';   // deviceId 为空 =
 let sent = 0, got = 0, dropped = 0, lastSentAt = 0, capSentAt = 0, lastCloseCode = 0;
 let okStreak = 0;        // 连续合格帧数，达到 CAPTURE_AFTER 就补传高清帧
 let capturing = false;   // 高清帧在途，期间暂停推流
-let zoomApplied = null;  // 已归一到的 zoom 倍数（不支持则为 null）
+let zoomApplied = null;  // 实际生效的 zoom 倍数（不支持 zoom 约束则为 null）
 let last = null;   // 最近一次结果，用于画框
 let viewW = 0, viewH = 0;   // 取景区的 CSS 像素尺寸（画框坐标就用这个坐标系）
 
@@ -160,7 +160,7 @@ function layout(){
 addEventListener('resize', layout);
 v.addEventListener('loadedmetadata', layout);
 
-/* ---------------- 自动挑后置主摄 ----------------
+/* ---------------- 自动挑视角最大的后置镜头 ----------------
 
    Web 端【没有】任何 API 能表达"用系统相机默认那颗镜头、默认那个倍数"。
    facingMode:'environment' 只保证是后置 —— 多摄手机上 Android Chrome 会把每颗
@@ -168,23 +168,29 @@ v.addEventListener('loadedmetadata', layout);
    很容易给到超广角或景深镜头。iOS Safari 只暴露一个逻辑后置相机、内部自动切，
    所以这基本是 Android 的问题。
 
-   这里逐个打开候选、按能力打分，判据按可靠性排序：
-     1) zoom 范围包含 1 且跨度最大的优先 —— 那通常是【逻辑相机】，
-        行为最接近原生（内部自动切镜头），而且把它归一到 zoom=1 就是原生的 1×。
-        注意别写成"zoom 下限<1 就是超广角"：逻辑相机的范围恰恰是 0.5~10，
-        那样会把最该选的那颗罚掉；独立枚举的物理超广角报的是它自己的 1~4。
-     2) 最大分辨率越高越可能是主摄 —— 超广角/景深通常给不出主摄的分辨率
-     3) label 里的索引越小越可能是主摄 —— camera2 0 通常是主摄
+   目标是【视角最大】的那颗（证件能离手机更近还装得下，取景更容易）。
+   Web API 没有 fieldOfView 这个能力项，所以用 zoom 下限当代理指标 ——
+   能缩到越小倍数的，视角就越广。判据按可靠性排序：
+     1) zoom 下限越小越优先 —— 逻辑相机常是 0.5~10（能用到超广角），
+        独立枚举的物理超广角报自己的 1~4
+     2) zoom 跨度越大越优先 —— 跨度大通常意味着是逻辑相机，覆盖的镜头更多
+     3) 最大分辨率更高的优先（同等视角下画质更好）
+     4) label 索引升序，仅作稳定排序用
 
-   ⚠ 判据 1 的 zoom 范围语义各家 ROM 不完全一致，我没有多摄安卓机可验证。
+   代价（已实测）：超广角有桶形畸变，而我们做的是【透视矫正】，
+   4 点透视变换在数学上无法纠正桶形畸变。实测角点误差随畸变增大：
+     无畸变 14.2px | 典型超广角(k1=-0.12) 18.0px | 强畸变(-0.20) 23.8px
+   检出率和判定（rot/skew/aspect）不受影响、不会误拒，只是角点精度下降约 1.3 倍。
+
+   ⚠ zoom 范围的语义各家 ROM 不完全一致，我没有多摄安卓机可验证。
    探测结果会 console.log 出来（也可以用 window.__camProbe 取），
    真机上如果挑错了，把那份打分数据发出来就能据实修正排序规则。
 
    探测要逐个开关摄像头，慢且屏幕会闪，所以结果缓存起来只做一次。
    用户手动选过镜头的话完全不走这条路径。 */
-const MAIN_CAM_KEY = 'cardpose.mainBackCam.v1';
+const MAIN_CAM_KEY = 'cardpose.widestBackCam.v2';   // 改了判据，换 key 让旧缓存自然失效
 
-async function pickMainBackCamera(){
+async function pickWidestBackCamera(){
   let devs = [];
   try {
     devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
@@ -214,8 +220,8 @@ async function pickMainBackCamera(){
         pixels: ((caps.width && caps.width.max) || st.width || 0)
               * ((caps.height && caps.height.max) || st.height || 0),
         zoom: z ? { min: z.min, max: z.max } : null,
-        // 能否归一到原生 1×，以及 zoom 跨度（跨度大 = 逻辑相机）
-        canBe1x: !!(z && z.min <= 1 && z.max >= 1),
+        // zoom 下限当"视角能有多广"的代理指标；没有 zoom 能力的按 1 处理
+        zoomMin: z ? z.min : 1,
         zoomSpan: z ? (z.max - z.min) : 0,
       });
     }catch(e){ /* 这颗打不开就跳过 */ }
@@ -224,27 +230,27 @@ async function pickMainBackCamera(){
   if (!scored.length) return '';
 
   scored.sort((a, b) => {
-    if (a.canBe1x !== b.canBe1x) return a.canBe1x ? -1 : 1;   // 能归一到 1× 的优先
-    if (b.zoomSpan !== a.zoomSpan) return b.zoomSpan - a.zoomSpan;  // 跨度大=逻辑相机
+    if (a.zoomMin !== b.zoomMin) return a.zoomMin - b.zoomMin;       // 能缩得更小=视角更广
+    if (b.zoomSpan !== a.zoomSpan) return b.zoomSpan - a.zoomSpan;   // 跨度大=逻辑相机
     if (b.pixels !== a.pixels) return b.pixels - a.pixels;
     return a.idx - b.idx;
   });
   window.__camProbe = scored;      // 真机排查用：控制台里直接看
-  console.log('[cam] 主摄探测打分（第一个是选中的）', scored);
+  console.log('[cam] 后置镜头探测打分（第一个是选中的，视角最大）', scored);
   return scored[0].id;
 }
 
-/* 把 zoom 归一到 1.0 —— 逻辑相机上 zoom=1 就等于原生相机的 1×。
-   这是最接近"系统默认倍数"的手段。只有 Chrome Android 支持 zoom 约束，
-   iOS Safari 不支持，所以全程用可选调用保护。 */
-async function normalizeZoom(track){
+/* 把 zoom 拉到能力下限 —— 这是拿到最大视角的关键一步。
+   光挑对设备不够：逻辑相机默认往往停在 1×（主摄等效），必须显式缩到 min
+   才会真正用上超广角。只有 Chrome Android 支持 zoom 约束，iOS Safari 不支持，
+   所以全程用可选调用保护，失败就沉默返回 null。 */
+async function applyWidestZoom(track){
   try{
     const caps = track.getCapabilities && track.getCapabilities();
-    if (!caps || !caps.zoom) return null;
-    if (caps.zoom.min <= 1 && caps.zoom.max >= 1){
-      await track.applyConstraints({ advanced: [{ zoom: 1 }] });
-      return 1;
-    }
+    if (!caps || !caps.zoom || typeof caps.zoom.min !== 'number') return null;
+    await track.applyConstraints({ advanced: [{ zoom: caps.zoom.min }] });
+    const got = (track.getSettings && track.getSettings().zoom);
+    return typeof got === 'number' ? got : caps.zoom.min;
   }catch(e){}
   return null;
 }
@@ -267,8 +273,8 @@ async function openCam(){
     if (cached){
       useId = cached;
     } else {
-      banner('正在识别后置主摄像头…（只做一次）', 'wait');
-      useId = await pickMainBackCamera();
+      banner('正在识别视角最大的后置镜头…（只做一次）', 'wait');
+      useId = await pickWidestBackCamera();
       if (useId){ try { localStorage.setItem(MAIN_CAM_KEY, useId); } catch(e){} }
     }
   }
@@ -300,7 +306,7 @@ async function openCam(){
   }
   v.srcObject = stream;
   await v.play().catch(()=>{});
-  zoomApplied = await normalizeZoom(stream.getVideoTracks()[0]);
+  zoomApplied = await applyWidestZoom(stream.getVideoTracks()[0]);
   layout();
   hideErr();
   await listCams();
@@ -320,7 +326,7 @@ async function listCams(){
   sel.innerHTML = '';
   const auto = new Option('摄像头：自动（' + (facing === 'user' ? '前置' : '后置') + '）', '');
   sel.appendChild(auto);
-  sel.appendChild(new Option('↻ 重新探测后置主摄', '__reprobe__'));
+  sel.appendChild(new Option('↻ 重新探测最广后置镜头', '__reprobe__'));
   ds.forEach((d, i) => {
     const o = new Option(d.label || ('摄像头 ' + (i + 1)), d.deviceId);
     sel.appendChild(o);
@@ -331,7 +337,7 @@ async function listCams(){
   $('sCam').textContent = (cur ? (cur.label || '未命名') : '-')
     + (st.width ? '  ' + st.width + '×' + st.height : '')
     + (zoomApplied ? '  zoom=' + zoomApplied + 'x' : '')
-    + (deviceId ? '  [手动]' : '  [自动挑主摄]');
+    + (deviceId ? '  [手动]' : '  [自动挑最广]');
   // 自动档时也把当前实际用的设备高亮出来，方便知道系统选了哪一个
   if (!deviceId && curId){
     const hit = [...sel.options].find(o => o.value === curId);
