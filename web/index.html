@@ -210,9 +210,11 @@ async function pickWidestBackCamera(){
   for (const d of pool){
     let s = null;
     try{
-      // 用高分辨率去问，才能比出各颗镜头的能力差异
+      // 请求【小分辨率】——摄像头初始化明显更快，黑屏时间更短。
+      // getCapabilities() 返回的是设备能力上限，与本次请求的分辨率无关，
+      // 所以照样能比出各颗镜头的 zoom 范围和最大分辨率。
       s = await navigator.mediaDevices.getUserMedia({
-        video: { deviceId:{exact:d.deviceId}, width:{ideal:1920}, height:{ideal:1440} }
+        video: { deviceId:{exact:d.deviceId}, width:{ideal:320}, height:{ideal:240} }
       });
       const t = s.getVideoTracks()[0];
       const st = t.getSettings ? (t.getSettings() || {}) : {};
@@ -222,6 +224,10 @@ async function pickWidestBackCamera(){
         id: d.deviceId,
         label: d.label || '(未命名)',
         idx: parseInt((String(d.label).match(/(\d+)/) || [, '99'])[1], 10),
+        // 注意：这里依赖 caps.width.max（设备能力上限）。若浏览器不支持
+        // getCapabilities()，会回落到 st.width，而低分辨率探测下所有候选都是
+        // 320 → 分辨率判据失效。但那种浏览器同样拿不到 zoom，本来也无法判断
+        // 视角，整体会退化成"第一个后置"，和不做探测等价 —— 可接受。
         pixels: ((caps.width && caps.width.max) || st.width || 0)
               * ((caps.height && caps.height.max) || st.height || 0),
         zoom: z ? { min: z.min, max: z.max } : null,
@@ -270,17 +276,12 @@ async function openCam(){
   stop();
   if (stream) stream.getTracks().forEach(t => t.stop());
 
-  // 自动档 + 后置时，用探测出的主摄。缓存过就直接用，没有才探一次。
+  // 手动指定 > 缓存 > 交给 facingMode。
+  // 关键：这里【不做探测】，先立刻出画面，避免黑屏。探测放到出画面之后、
+  // 而且只在确实需要时才做（见下面的快路径判断）。
   let useId = deviceId;
   if (!useId && facing === 'environment'){
-    let cached = null;
-    try { cached = localStorage.getItem(MAIN_CAM_KEY); } catch(e){}
-    if (cached){
-      useId = cached;
-    } else {
-      useId = await pickWidestBackCamera();
-      if (useId){ try { localStorage.setItem(MAIN_CAM_KEY, useId); } catch(e){} }
-    }
+    try { useId = localStorage.getItem(MAIN_CAM_KEY) || ''; } catch(e){}
   }
 
   const vid = useId
@@ -310,10 +311,58 @@ async function openCam(){
   }
   v.srcObject = stream;
   await v.play().catch(()=>{});
-  zoomApplied = await applyWidestZoom(stream.getVideoTracks()[0]);
+  let track = stream.getVideoTracks()[0];
+  zoomApplied = await applyWidestZoom(track);
   layout();
   hideErr();
   await listCams();
+
+  // ---- 只在必要时才探测，避免无谓的黑屏 ----
+  //
+  // 快路径：如果当前这颗本身就能缩到 zoom < 1，说明它已经是一个能用上超广角的
+  // 逻辑相机 —— 上面 applyWidestZoom 已经把它拉到最广了，不需要再探测别的镜头。
+  // 现代多摄手机大多走这条路，代价为零、无黑屏。
+  //
+  // 慢路径：只有当前这颗缩不下去（zoom.min >= 1 或压根不支持 zoom）时，才说明
+  // 广角可能在另一个设备上，这时才值得付黑屏的代价去探一次。结果会缓存。
+  if (!deviceId && facing === 'environment' && !useId){
+    const caps = (track.getCapabilities && track.getCapabilities()) || {};
+    const canGoWide = !!(caps.zoom && caps.zoom.min < 1);
+    const curId = (track.getSettings && track.getSettings().deviceId) || '';
+
+    if (canGoWide){
+      if (curId){ try { localStorage.setItem(MAIN_CAM_KEY, curId); } catch(e){} }
+    } else {
+      banner('正在查找更广的镜头…', 'wait');
+      const best = await pickWidestBackCamera();
+      if (best && best !== curId){
+        try { localStorage.setItem(MAIN_CAM_KEY, best); } catch(e){}
+        // 探测过程已经把流停掉了，用挑中的那颗重开
+        if (stream) stream.getTracks().forEach(t => t.stop());
+        try{
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { deviceId:{exact:best}, width:{ideal:1280}, height:{ideal:960},
+                     resizeMode:'none' },
+            audio: false,
+          });
+          v.srcObject = stream;
+          await v.play().catch(()=>{});
+          track = stream.getVideoTracks()[0];
+          zoomApplied = await applyWidestZoom(track);
+          layout();
+          await listCams();
+        }catch(e){
+          // 挑中的这颗反而打不开：清掉缓存，下次重新走一遍
+          try { localStorage.removeItem(MAIN_CAM_KEY); } catch(e2){}
+          return openCam();
+        }
+      } else if (curId){
+        // 探完发现当前这颗就是最广的，记下来省得下次再探
+        try { localStorage.setItem(MAIN_CAM_KEY, curId); } catch(e){}
+      }
+      banner('点击「开始」', 'wait');
+    }
+  }
   return true;
 }
 
