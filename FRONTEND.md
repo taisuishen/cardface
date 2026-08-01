@@ -10,21 +10,21 @@
 ### 当前环境地址
 
 ```
-WS      wss://hhkj9hm2wdb60a-8000.proxy.runpod.net/ws
-健康检查 https://hhkj9hm2wdb60a-8000.proxy.runpod.net/health
-负载状态 https://hhkj9hm2wdb60a-8000.proxy.runpod.net/stats
-调试页面 https://hhkj9hm2wdb60a-8000.proxy.runpod.net/
+WS      wss://tr05uksdg3cpmu-8000.proxy.runpod.net/ws
+健康检查 https://tr05uksdg3cpmu-8000.proxy.runpod.net/health
+负载状态 https://tr05uksdg3cpmu-8000.proxy.runpod.net/stats
+调试页面 https://tr05uksdg3cpmu-8000.proxy.runpod.net/
 ```
 
 ```js
-const WS_URL = 'wss://hhkj9hm2wdb60a-8000.proxy.runpod.net/ws';
+const WS_URL = 'wss://tr05uksdg3cpmu-8000.proxy.runpod.net/ws';
 const ws = new WebSocket(WS_URL);
 ws.binaryType = 'arraybuffer';
 ```
 
 RunPod 的这个域名是**受信任证书**，手机可以直接开，不用处理证书告警。
 
-> **地址会变。** `hhkj9hm2wdb60a` 是 Pod ID —— 停机再开不变，但**重建 Pod 会换成新的**。
+> **地址会变。** `tr05uksdg3cpmu` 是 Pod ID —— 停机再开不变，但**重建 Pod 会换成新的**。
 > 所以别把它写死在代码里，用环境变量 / 配置项注入。
 > 拿法：Pod 详情页 → Connect → HTTP Services 里 8000 那条。
 
@@ -379,7 +379,7 @@ function again(){
 
 ```js
 // 生产环境请用配置注入，别写死 —— 重建 Pod 会换 ID
-const WS_URL = 'wss://hhkj9hm2wdb60a-8000.proxy.runpod.net/ws';
+const WS_URL = 'wss://tr05uksdg3cpmu-8000.proxy.runpod.net/ws';
 
 const FPS = 3, LONG_SIDE = 960, TARGET_KB = 100;
 const MAX_BUFFERED = 3 * TARGET_KB * 1024;      // 背压：只看未发出字节数
@@ -456,7 +456,7 @@ function retry(videoEl){ ws.send(JSON.stringify({type:'reset'})); startSending(v
 先用 curl 确认服务本身是否正常，排除前端因素：
 
 ```bash
-curl https://hhkj9hm2wdb60a-8000.proxy.runpod.net/health
+curl https://tr05uksdg3cpmu-8000.proxy.runpod.net/health
 ```
 
 正常应返回，且 `card_providers` 里要有 `CUDAExecutionProvider`（否则是在用 CPU，慢 3 倍）：

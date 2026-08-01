@@ -108,8 +108,18 @@ const FPS         = 3;            // 每秒发送帧数
 //   高清帧只在"连续 N 帧合格"后传一次，用来出最终裁图 —— 回传的证件图是从
 //   上传帧透视矫正来的，这一张必须够清晰，否则 OCR 会受影响。
 const STREAM_LONG = 416, STREAM_Q  = 0.60;   // 约 7KB
-const CAP_LONG    = 960, CAP_Q     = 0.92;   // 约 100KB+
-const CAPTURE_AFTER = 3;          // 连续几帧合格后自动上传高清帧
+// 高清帧质量：真实照片实测 q92=106KB / q82=70KB(省34%, PSNR 41.6dB 视觉无差别)。
+// 证件细节比普通照片还多（细纹、防伪底纹），真机上 q92 实测到过 177KB，
+// 手机 4G 上行 0.3MB/s 传这个要 0.6 秒，纯属浪费。q82 对 OCR 完全够用。
+const CAP_LONG    = 960, CAP_Q     = 0.82;
+const CAP_MAX_KB  = 110;          // 高清帧体积上限，超了自动降质量重编一次
+
+// 连续几帧合格后自动上传高清帧。
+// 证件要 3 帧：四角回归对手抖敏感，多确认几帧能避免抓到正在移动的一帧。
+// 人脸只要 1 帧：判定项（大小/角度/清晰度）本身就已经把不合格的挡掉了，
+// 再等 3 帧纯属拖慢体验。
+const CAPTURE_AFTER_BY_MODE = { card: 3, face: 1 };
+function captureAfter(){ return CAPTURE_AFTER_BY_MODE[mode] || 1; }
 
 // 背压：只看"还没发出去的字节数"，不看有没有收到结果。
 //
@@ -125,7 +135,7 @@ const cap = document.createElement('canvas'), cctx = cap.getContext('2d');
 
 let ws = null, stream = null, timer = null, pingTimer = null;
 let mode = 'card', facing = 'environment', deviceId = '';   // deviceId 为空 = 按 facing 自动选
-let sent = 0, got = 0, dropped = 0, lastSentAt = 0, lastCloseCode = 0;
+let sent = 0, got = 0, dropped = 0, lastSentAt = 0, capSentAt = 0, lastCloseCode = 0;
 let okStreak = 0;        // 连续合格帧数，达到 CAPTURE_AFTER 就补传高清帧
 let capturing = false;   // 高清帧在途，期间暂停推流
 let last = null;   // 最近一次结果，用于画框
@@ -260,7 +270,12 @@ function onMsg(m){
   dropped += (m.dropped || 0);
 
   $('sMs').textContent    = m.ms + ' ms';
-  $('sRtt').textContent   = (performance.now() - lastSentAt).toFixed(0) + ' ms';
+  // 高清帧和流式帧要分别计时。之前统一用 lastSentAt，而 lastSentAt 只在
+  // 流式发送时更新、且高清上传期间推流是暂停的，导致高清帧的"往返"把
+  // 等凑够连续帧 + 手机编码 JPEG 的时间也算进去了（真机上显示成 3655ms）。
+  const t_ref = m.capture ? capSentAt : lastSentAt;
+  $('sRtt').textContent = (t_ref ? (performance.now() - t_ref).toFixed(0) : '-')
+      + ' ms' + (m.capture ? ' (高清帧)' : '');
   $('sReason').textContent= m.reason;
   $('sConf').textContent  = (m.conf ?? '-');
   $('sSize').textContent  = (m.bytes_in/1024).toFixed(0) + ' KB @ '
@@ -285,13 +300,13 @@ function onMsg(m){
   } else {
     // 流式帧：数连续合格帧，够了就补传高清帧
     okStreak = m.ok ? okStreak + 1 : 0;
-    if (okStreak >= CAPTURE_AFTER && !capturing) sendCapture();
+    if (okStreak >= captureAfter() && !capturing) sendCapture();
   }
-  $('sStreak').textContent = okStreak + '/' + CAPTURE_AFTER
+  $('sStreak').textContent = okStreak + '/' + captureAfter()
       + (capturing ? '  高清帧上传中' : '');
 
   if (!capturing && !m.capture){
-    banner(m.msg + (okStreak ? '  ' + okStreak + '/' + CAPTURE_AFTER : ''),
+    banner(m.msg + (okStreak ? '  ' + okStreak + '/' + captureAfter() : ''),
            m.ok ? 'ok' : (m.reason === 'unstable' ? 'wait' : 'bad'));
   }
 
@@ -360,16 +375,26 @@ function grabAt(longSide, q){
 }
 function grab(){ return grabAt(STREAM_LONG, STREAM_Q); }
 
-/* 连续 CAPTURE_AFTER 帧合格后，自动补传一张高清帧出最终裁图。
+/* 连续 captureAfter() 帧合格后，自动补传一张高清帧出最终裁图。
    先发 {"type":"capture"} 告诉服务端"下一个二进制帧按高清处理"，
    服务端对这一帧走无状态严格判定，通不过不会闭锁、可以继续重试。 */
 async function sendCapture(){
   if (!ws || ws.readyState !== 1 || capturing) return;
   capturing = true;
-  const blob = await grabAt(CAP_LONG, CAP_Q);
+  // 体积上限：证件细纹/防伪底纹很多，同样质量下比普通照片大不少
+  // （真机实测 q92 到过 177KB；细节极端的图 q82 还能到 240KB，
+  //  所以只降一档不够，要循环降到上限以下）。
+  // 手机上多编一次约几十毫秒，比在慢上行上多传几十 KB 便宜得多。
+  // 只降质量不降分辨率：分辨率直接决定最终裁图的清晰度，代价更大。
+  let blob = null;
+  for (let q = CAP_Q; q >= 0.5; q -= 0.12){
+    blob = await grabAt(CAP_LONG, q);
+    if (!blob || blob.size / 1024 <= CAP_MAX_KB) break;
+  }
   if (!blob){ capturing = false; return; }
   banner('已对准，正在上传高清图…', 'wait');
   ws.send(JSON.stringify({type:'capture'}));
+  capSentAt = performance.now();
   ws.send(await blob.arrayBuffer());
 }
 
