@@ -116,55 +116,70 @@ def _b64(data: bytes) -> str:
 
 # ------------------------------------------------------------------ 同步处理
 def process_card(bgr: np.ndarray, stable: int, tracker: CardTracker) -> tuple[dict, int]:
-    r = tracker.step(bgr)          # 带 EMA 平滑 / 滞回 / 投票，见 CardTracker
-    need = card_det.rule.stable_frames
+    """流式帧：只出判定和画框坐标，不回图。
+
+    客户端推的是小图（约 7KB），只够做姿态判定和实时提示；
+    等它自己数到连续 N 帧合格，会另外上传一张高清帧走 process_capture。
+    """
+    r = tracker.step(bgr)          # 判定用原始角点、画框用平滑角点，见 CardTracker
     payload = {
-        "mode": "card", "ok": False, "reason": r.reason, "msg": r.msg,
+        "mode": "card", "ok": r.ok, "reason": r.reason, "msg": r.msg,
         "conf": round(r.conf, 3), "rotate_deg": r.rotate_deg, "skew": r.skew,
         "area_ratio": r.area_ratio, "aspect": r.aspect, "quad": r.quad,
         "raw_quad": r.raw_quad, "jitter": r.jitter, "held": r.held, "votes": r.votes,
     }
+    return payload, (stable + 1 if r.ok else 0)
+
+
+def process_capture(bgr: np.ndarray, mode: str) -> dict:
+    """高清抓拍帧：判定通过就裁图回传。
+
+    这里刻意用【无状态】的 judge()：它返回的是这一帧自己的原始角点，
+    不含任何时域平滑。平滑值混了前几帧位置，证件一移动就落后（实测覆盖率
+    94.5% vs 97%，缺的那 5% 就是"证件不全"），绝不能拿来裁图。
+    """
+    if mode == "face":
+        r = face_det.judge(bgr)
+        payload = {
+            "mode": "face", "capture": True, "ok": False,
+            "reason": r.reason, "msg": r.msg, "conf": r.conf, "box": r.box,
+            "landmarks": r.landmarks, "roll_deg": r.roll_deg,
+            "yaw_ratio": r.yaw_ratio, "area_ratio": r.area_ratio,
+            "count": r.count, "sharp": r.sharp,
+        }
+        if not r.ok:
+            return payload
+        crop = face_det.crop(bgr, r.box)
+        payload.update(ok=True, final=True, image=_b64(_jpeg(crop)),
+                       image_size=[crop.shape[1], crop.shape[0]])
+        return payload
+
+    r = card_det.judge(bgr)
+    payload = {
+        "mode": "card", "capture": True, "ok": False,
+        "reason": r.reason, "msg": r.msg, "conf": round(r.conf, 3),
+        "rotate_deg": r.rotate_deg, "skew": r.skew, "aspect": r.aspect,
+        "area_ratio": r.area_ratio, "quad": r.quad,
+    }
     if not r.ok:
-        return payload, 0
-
-    stable += 1
-    payload["stable"] = f"{stable}/{need}"
-    if stable < need:
-        payload["reason"] = "unstable"
-        payload["msg"] = "保持不动…"
-        return payload, stable
-
+        # 高清帧没通过就不闭锁，让客户端继续推流重试
+        return payload
     card = CardPoseDetector.warp(bgr, r.quad)
-    payload["ok"] = True
-    payload["image"] = _b64(_jpeg(card))
-    payload["image_size"] = [card.shape[1], card.shape[0]]
-    return payload, stable
+    payload.update(ok=True, final=True, image=_b64(_jpeg(card)),
+                   image_size=[card.shape[1], card.shape[0]])
+    return payload
 
 
 def process_face(bgr: np.ndarray, stable: int) -> tuple[dict, int]:
+    """流式帧：只出判定，不回图（同 process_card）。"""
     r = face_det.judge(bgr)
-    need = face_det.rule.stable_frames
     payload = {
-        "mode": "face", "ok": False, "reason": r.reason, "msg": r.msg,
+        "mode": "face", "ok": r.ok, "reason": r.reason, "msg": r.msg,
         "conf": r.conf, "box": r.box, "landmarks": r.landmarks,
         "roll_deg": r.roll_deg, "yaw_ratio": r.yaw_ratio,
         "area_ratio": r.area_ratio, "count": r.count, "sharp": r.sharp,
     }
-    if not r.ok:
-        return payload, 0
-
-    stable += 1
-    payload["stable"] = f"{stable}/{need}"
-    if stable < need:
-        payload["reason"] = "unstable"
-        payload["msg"] = "保持不动…"
-        return payload, stable
-
-    crop = face_det.crop(bgr, r.box)
-    payload["ok"] = True
-    payload["image"] = _b64(_jpeg(crop))
-    payload["image_size"] = [crop.shape[1], crop.shape[0]]
-    return payload, stable
+    return payload, (stable + 1 if r.ok else 0)
 
 
 # ------------------------------------------------------------------ WebSocket
@@ -186,6 +201,8 @@ class Conn:
         self.rec_dir: str | None = None
         self.done = False                      # 已抓到合格结果，闭锁；收 reset 才解开
         self.ignored = 0                       # 闭锁后忽略掉的帧数
+        self.expect_capture = False            # 下一个二进制帧是高清抓拍帧
+        self.capture: bytes | None = None      # 高清帧单独存，绝不被流式帧覆盖
 
     def submit(self, data: bytes):
         # 一次性抓拍：已经出过合格结果就彻底不再处理，也不回消息。
@@ -193,8 +210,16 @@ class Conn:
         if self.done:
             self.ignored += 1
             return
+
+        if self.expect_capture:
+            # 高清帧只传一次，必须保证被处理 —— 不参与 latest-wins 丢弃
+            self.expect_capture = False
+            self.capture = data
+            self.event.set()
+            return
+
         if self.pending is not None:
-            self.dropped += 1          # 上一帧还没处理完，丢掉它
+            self.dropped += 1          # 上一帧还没处理完，丢掉它（只丢流式帧）
         self.pending = data
         self.event.set()
 
@@ -203,6 +228,8 @@ class Conn:
         self.done = False
         self.ignored = 0
         self.pending = None
+        self.capture = None
+        self.expect_capture = False
         self.stable_card = self.stable_face = 0
         self.tracker.reset()
 
@@ -211,7 +238,12 @@ class Conn:
         while not self.closed:
             await self.event.wait()
             self.event.clear()
-            data, self.pending = self.pending, None
+            # 高清抓拍帧优先，且不会被丢
+            is_cap = self.capture is not None
+            if is_cap:
+                data, self.capture = self.capture, None
+            else:
+                data, self.pending = self.pending, None
             if data is None:
                 continue
 
@@ -224,7 +256,10 @@ class Conn:
                 bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
                 if bgr is None:
                     raise ValueError("JPEG 解码失败")
-                if mode == "face":
+                if is_cap:
+                    payload = await loop.run_in_executor(
+                        None, process_capture, bgr, mode)
+                elif mode == "face":
                     payload, self.stable_face = await loop.run_in_executor(
                         None, process_face, bgr, self.stable_face)
                 else:
@@ -308,6 +343,9 @@ async def ws_endpoint(ws: WebSocket):
                         conn.unlock()          # 换模式相当于重新开一次抓拍
                         await ws.send_text(json.dumps(
                             {"type": "config_ok", "mode": m}, ensure_ascii=False))
+                elif cmd.get("type") == "capture":
+                    # 紧跟其后的那个二进制帧按高清抓拍处理
+                    conn.expect_capture = True
                 elif cmd.get("type") == "record":
                     n = max(1, min(int(cmd.get("n", 60)), 600))
                     d = os.path.join(DUMP_ROOT, datetime.now().strftime("%Y%m%d_%H%M%S"))

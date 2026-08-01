@@ -318,53 +318,75 @@ class CardTracker:
         self.votes: list[bool] = []
 
     def step(self, bgr: np.ndarray) -> CardResult:
+        """判定用【当前帧的原始角点】，画框用【平滑角点】。
+
+        为什么必须分开 —— 平滑角点混了前几帧的位置，证件一移动就系统性落后：
+        实测证件持续平移时，平滑角点只覆盖真实证件的 94.5%（偏移 26px，
+        且随移动持续变大到 37px），而原始角点覆盖 97%（偏移 17px）。
+        缺的那 5% 就是"回传的证件不全"。证件静止时两者完全一致（98.6%），
+        所以平滑对画框有益、对裁图有害。
+
+        判定也必须跟着用原始角点：否则会出现"拿平滑值判合格、拿原始值裁图"
+        的错配，而且平滑还能把不合格的帧救成合格（EMA 会把斜证件的 skew
+        从 0.25 拉到 0.11）。防抖交给投票窗口做，不靠放宽阈值。
+        """
         H, W = bgr.shape[:2]
         q, conf = self.det._infer(bgr)
-        held = False
         jitter = 0.0
         raw = [] if q is None else [[round(float(x), 1), round(float(y), 1)] for x, y in q]
 
         if q is None:
-            # 偶尔漏检就沿用上次的平滑结果，避免框闪掉一帧又出现
+            # 偶尔漏检：沿用上次平滑结果只为让框不闪，绝不判合格
             self.miss += 1
             if self.sq is None or self.miss > self.s.miss_keep:
                 self.reset()
                 return CardResult(False, "no_card", REASON_TEXT["no_card"])
-            q, held = self.sq.copy(), True
-            conf = 0.0
+            r = self.det.judge_quad(self.sq, 0.0, W, H)
+            r.ok = False
+            if r.reason == "ok":
+                r.reason, r.msg = "unstable", "保持不动…"
+            self.votes.append(False)
+            if len(self.votes) > self.s.vote_win:
+                self.votes.pop(0)
+            self.ok_state = False
+            r.quad = [[round(float(x), 1), round(float(y), 1)] for x, y in self.sq]
+            r.raw_quad = []
+            r.held = True
+            r.votes = f"{sum(self.votes)}/{len(self.votes)}"
+            return r
+
+        self.miss = 0
+
+        # ---- 严格闸门：用未平滑的原始角点判定，不放宽阈值 ----
+        r = self.det.judge_quad(q, conf, W, H, relax=1.0)
+        frame_ok = r.ok
+
+        # ---- 平滑只用于画框 ----
+        if self.sq is None:
+            self.sq = q.copy()
         else:
-            self.miss = 0
-            if self.sq is None:
-                self.sq = q.copy()
+            jitter = float(np.linalg.norm(q - self.sq, axis=1).mean())
+            if jitter > self.s.reset_px:
+                self.sq = q.copy()          # 换了位置/换了一张，别把两个位置平均
+                self.votes.clear()
             else:
-                jump = float(np.linalg.norm(q - self.sq, axis=1).mean())
-                jitter = jump
-                if jump > self.s.reset_px:
-                    self.sq = q.copy()          # 证件换位置/换了一张，别把两个位置平均起来
-                    self.votes.clear()
-                    self.ok_state = False
-                else:
-                    a = self.s.ema
-                    self.sq = a * q + (1 - a) * self.sq
-            q = self.sq
+                a = self.s.ema
+                self.sq = a * q + (1 - a) * self.sq
 
-        # 滞回：已经合格了就用放宽的阈值，避免在阈值边界上反复翻转
-        r = self.det.judge_quad(q, conf, W, H,
-                               relax=self.s.hyst if self.ok_state else 1.0)
-
-        # 投票：窗口内多数合格才对外宣布合格
-        self.votes.append(r.ok)
+        # ---- 投票：窗口内够票 且 本帧自己也过，才对外宣布合格 ----
+        self.votes.append(frame_ok)
         if len(self.votes) > self.s.vote_win:
             self.votes.pop(0)
         passed = sum(self.votes)
-        voted_ok = passed >= min(self.s.vote_need, len(self.votes)) and r.ok
+        voted_ok = frame_ok and passed >= min(self.s.vote_need, len(self.votes))
         self.ok_state = voted_ok
 
         r.ok = voted_ok
         if not voted_ok and r.reason == "ok":
             r.reason, r.msg = "unstable", "保持不动…"
-        r.raw_quad = raw
-        r.held = held
+        r.quad = [[round(float(x), 1), round(float(y), 1)] for x, y in self.sq]  # 画框用
+        r.raw_quad = raw                                                        # 裁图用
+        r.held = False
         r.jitter = round(jitter, 1)
         r.votes = f"{passed}/{len(self.votes)}"
         return r

@@ -93,17 +93,31 @@
       <tr><td>推理后端</td><td id="sBk">-</td></tr>
       <tr><td>当前摄像头</td><td id="sCam">-</td></tr>
       <tr><td>角点抖动 / 投票</td><td id="sJit">-</td></tr>
+      <tr><td>连续合格 / 触发</td><td id="sStreak">-</td></tr>
     </table>
   </div>
 </div>
 
 <script>
 const FPS         = 3;            // 每秒发送帧数
-const TARGET_KB   = 100;          // 目标单帧大小
-const LONG_SIDE   = 960;          // 上传图长边（与模型输入一致）
+
+// 两级分辨率：
+//   流式帧只用来做姿态判定和实时提示 —— 实测把长边从 960 降到 416、质量降到 60，
+//   单帧从 51KB 掉到 7KB（省 86%），而检出率仍是 10/10、角点误差 17.8px vs 18.2px，
+//   基本没损失（模型反正会 letterbox 到 960，证件四角是粗特征）。
+//   高清帧只在"连续 N 帧合格"后传一次，用来出最终裁图 —— 回传的证件图是从
+//   上传帧透视矫正来的，这一张必须够清晰，否则 OCR 会受影响。
+const STREAM_LONG = 416, STREAM_Q  = 0.60;   // 约 7KB
+const CAP_LONG    = 960, CAP_Q     = 0.92;   // 约 100KB+
+const CAPTURE_AFTER = 3;          // 连续几帧合格后自动上传高清帧
+
 // 背压：只看"还没发出去的字节数"，不看有没有收到结果。
-// 约 3 帧的量；超了说明上行堵住了，跳过这一帧（服务端反正只处理最新的）。
-const MAX_BUFFERED= 3 * TARGET_KB * 1024;
+//
+// 阈值 = 最多容忍多少排队延迟。积压 B 字节、上行 U 字节/秒，新帧就要多等 B/U 秒。
+// 手机上行常只有 ~300KB/s，所以按"最多 ~100ms 排队"取值：
+// 流式帧只有 7KB，3 帧 ≈ 21KB ≈ 70ms，很合适。
+// （注意别按 100KB 的老尺寸去算，那样 3 帧就是 1 秒排队，比一帧一答还慢。）
+const MAX_BUFFERED= 24 * 1024;
 
 const $ = id => document.getElementById(id);
 const v = $('v'), ov = $('ov'), ctx = ov.getContext('2d');
@@ -111,7 +125,9 @@ const cap = document.createElement('canvas'), cctx = cap.getContext('2d');
 
 let ws = null, stream = null, timer = null, pingTimer = null;
 let mode = 'card', facing = 'environment', deviceId = '';   // deviceId 为空 = 按 facing 自动选
-let quality = 0.7, sent = 0, got = 0, dropped = 0, lastSentAt = 0, lastCloseCode = 0;
+let sent = 0, got = 0, dropped = 0, lastSentAt = 0, lastCloseCode = 0;
+let okStreak = 0;        // 连续合格帧数，达到 CAPTURE_AFTER 就补传高清帧
+let capturing = false;   // 高清帧在途，期间暂停推流
 let last = null;   // 最近一次结果，用于画框
 let viewW = 0, viewH = 0;   // 取景区的 CSS 像素尺寸（画框坐标就用这个坐标系）
 
@@ -248,7 +264,8 @@ function onMsg(m){
   $('sReason').textContent= m.reason;
   $('sConf').textContent  = (m.conf ?? '-');
   $('sSize').textContent  = (m.bytes_in/1024).toFixed(0) + ' KB @ '
-                          + m.frame_size[0] + '×' + m.frame_size[1];
+                          + m.frame_size[0] + '×' + m.frame_size[1]
+                          + (m.capture ? '  (高清)' : '');
   $('sJit').textContent = m.mode === 'card'
       ? (m.jitter != null ? m.jitter + ' px' : '-') + ' / ' + (m.votes || '-')
         + (m.held ? '  (漏检沿用上帧)' : '')
@@ -258,7 +275,25 @@ function onMsg(m){
       ? (m.rotate_deg ?? '-') + '° / ' + (m.skew ?? '-')
       : 'roll ' + (m.roll_deg ?? '-') + '° / yaw ' + (m.yaw_ratio ?? '-');
 
-  banner(m.msg + (m.stable && !m.ok ? '  ' + m.stable : ''), m.ok ? 'ok' : (m.reason==='unstable'?'wait':'bad'));
+  if (m.capture){
+    // 高清帧的回执
+    capturing = false;
+    if (!m.ok){
+      okStreak = 0;                        // 高清帧没通过：清零重来，服务端也没闭锁
+      banner('高清帧未通过（' + m.msg + '），继续对准…', 'bad');
+    }
+  } else {
+    // 流式帧：数连续合格帧，够了就补传高清帧
+    okStreak = m.ok ? okStreak + 1 : 0;
+    if (okStreak >= CAPTURE_AFTER && !capturing) sendCapture();
+  }
+  $('sStreak').textContent = okStreak + '/' + CAPTURE_AFTER
+      + (capturing ? '  高清帧上传中' : '');
+
+  if (!capturing && !m.capture){
+    banner(m.msg + (okStreak ? '  ' + okStreak + '/' + CAPTURE_AFTER : ''),
+           m.ok ? 'ok' : (m.reason === 'unstable' ? 'wait' : 'bad'));
+  }
 
   if (m.ok && m.image){
     $('shot').src = m.image; $('shot').style.display = 'block'; $('empty').style.display = 'none';
@@ -283,7 +318,7 @@ function banner(text, cls){ const b = $('banner'); b.textContent = text; b.class
 /* ---------------- 叠加绘制 ---------------- */
 function draw(m){
   ctx.clearRect(0,0,viewW,viewH);
-  // 关键：服务端返回的坐标属于"上传帧"坐标系（grab() 里把长边缩到 LONG_SIDE，
+  // 关键：服务端返回的坐标属于"上传帧"坐标系（流式帧 STREAM_LONG、高清帧 CAP_LONG，
   // 例如 960×720），不是 video.videoWidth（1280×960）。用 videoWidth 换算会让框
   // 整体缩小并偏向左上角，所以这里必须用服务端回传的 frame_size。
   const fw = m.frame_size && m.frame_size[0], fh = m.frame_size && m.frame_size[1];
@@ -313,15 +348,29 @@ function draw(m){
   }
 }
 
-/* ---------------- 采集 + 自适应压到 ~100KB ---------------- */
-function grab(){
+/* ---------------- 采集 ---------------- */
+function grabAt(longSide, q){
   const vw = v.videoWidth, vh = v.videoHeight;
   if (!vw) return null;
-  const s = LONG_SIDE / Math.max(vw,vh);
+  const s = longSide / Math.max(vw,vh);
   cap.width  = Math.round(vw*s);
   cap.height = Math.round(vh*s);
   cctx.drawImage(v, 0, 0, cap.width, cap.height);
-  return new Promise(r => cap.toBlob(r, 'image/jpeg', quality));
+  return new Promise(r => cap.toBlob(r, 'image/jpeg', q));
+}
+function grab(){ return grabAt(STREAM_LONG, STREAM_Q); }
+
+/* 连续 CAPTURE_AFTER 帧合格后，自动补传一张高清帧出最终裁图。
+   先发 {"type":"capture"} 告诉服务端"下一个二进制帧按高清处理"，
+   服务端对这一帧走无状态严格判定，通不过不会闭锁、可以继续重试。 */
+async function sendCapture(){
+  if (!ws || ws.readyState !== 1 || capturing) return;
+  capturing = true;
+  const blob = await grabAt(CAP_LONG, CAP_Q);
+  if (!blob){ capturing = false; return; }
+  banner('已对准，正在上传高清图…', 'wait');
+  ws.send(JSON.stringify({type:'capture'}));
+  ws.send(await blob.arrayBuffer());
 }
 
 async function tick(){
@@ -343,13 +392,11 @@ async function tick(){
     return;
   }
 
+  // 高清帧在途时先别继续推流，省得跟它抢上行
+  if (capturing) return;
+
   const blob = await grab();
   if (!blob) return;
-
-  // 反馈式调整质量，让每帧稳定在 TARGET_KB 附近
-  const kb = blob.size/1024;
-  if (kb > TARGET_KB*1.15)      quality = Math.max(0.35, quality - 0.05);
-  else if (kb < TARGET_KB*0.75) quality = Math.min(0.92, quality + 0.04);
 
   ws.send(await blob.arrayBuffer());
   sent++; lastSentAt = performance.now();
@@ -375,7 +422,7 @@ async function start(){
       return;
     }
   }
-  sent = 0; got = 0; dropped = 0; t0 = performance.now();
+  sent = 0; got = 0; dropped = 0; okStreak = 0; capturing = false; t0 = performance.now();
   clearInterval(timer);
   timer = setInterval(tick, 1000/FPS);
   banner('识别中…', 'wait');
@@ -391,7 +438,7 @@ $('btnAgain').onclick = () => {
   $('btnAgain').style.display = 'none';
   $('btnStart').style.display = '';
   $('shot').style.display = 'none'; $('empty').style.display = 'block';
-  last = null; ctx.clearRect(0,0,viewW,viewH);
+  last = null; okStreak = 0; capturing = false; ctx.clearRect(0,0,viewW,viewH);
   start();
 };
 $('btnCam').onclick   = async () => {
@@ -422,7 +469,7 @@ function setMode(m){
   $('sMode').textContent = m;
   $('shot').style.display='none'; $('empty').style.display='block';
   $('btnAgain').style.display='none'; $('btnStart').style.display='';   // 换模式=重开一次抓拍
-  last = null;
+  last = null; okStreak = 0; capturing = false;
   ctx.clearRect(0,0,viewW,viewH);
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'config', mode:m}));
   // 证件用后置、人脸用前置，更符合实际使用。

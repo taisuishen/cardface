@@ -104,6 +104,27 @@ def draw_face(W=960, H=720):
                    0, 255).astype(np.uint8)
 
 
+async def do_capture(ws, frame, mode, label="高清抓拍"):
+    """两级分辨率：流式帧只出判定，判定连续合格后再传一张高清帧出裁图。
+    这里模拟客户端那一步：先发 {"type":"capture"}，紧跟其后的二进制帧按高清处理。"""
+    import cv2 as _cv2
+    h, w = frame.shape[:2]
+    s = 960 / max(w, h)
+    big = _cv2.resize(frame, (round(w * s), round(h * s)))
+    ok, e = _cv2.imencode(".jpg", big, [_cv2.IMWRITE_JPEG_QUALITY, 92])
+    data = e.tobytes()
+    await ws.send(json.dumps({"type": "capture"}))
+    await ws.send(data)
+    while True:
+        m = json.loads(await ws.recv())
+        if m.get("type") == "result" and m.get("capture"):
+            break
+    kb = len(m.get("image", "")) * 3 / 4 / 1024 if m.get("image") else 0
+    print(f"  {label}: 上传 {len(data)/1024:.0f}KB -> ok={m['ok']} reason={m['reason']}"
+          + (f"  回传图 {m['image_size'][0]}x{m['image_size'][1]} {kb:.0f}KB" if m.get("image") else ""))
+    return m
+
+
 async def run_mode(ws, mode, frames, label):
     # 服务端是"一次性抓拍"：出过合格结果就闭锁、不再回消息。
     # 每个场景开始前先 reset 解锁，否则第二个场景就一条回复也收不到。
@@ -113,8 +134,13 @@ async def run_mode(ws, mode, frames, label):
     got, saved = [], 0
 
     async def sender():
+        # 流式帧走小图（长边 416 / q60，约 7KB），和前端一致
         for f in frames:
-            await ws.send(to_jpeg(f))
+            h, w = f.shape[:2]
+            s = 416 / max(w, h)
+            small = cv2.resize(f, (round(w * s), round(h * s)))
+            _, e = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            await ws.send(e.tobytes())
             await asyncio.sleep(1 / FPS)
 
     send_task = asyncio.create_task(sender())
@@ -163,9 +189,12 @@ async def main():
                  [shoot(card, cmask, angle=1, scale=1.35, seed=i)[0] for i in range(4)]
         got = await run_mode(ws, "card", frames, "证件：歪 3 帧 -> 正 4 帧")
         tilted = [m for m in got[:3] if not m["ok"] and m["reason"] == "tilted"]
-        accepted = [m for m in got[3:] if m["ok"] and m.get("image")]
-        print(f"  检查: 歪的被拒 {len(tilted)}/3, 正的回传图 {len(accepted)}/4 (前1帧防抖不回传属正常)")
-        if not tilted or not accepted:
+        streak_ok = [m for m in got[3:] if m["ok"]]
+        cap = await do_capture(ws, frames[-1], "card")
+        accepted = [cap] if (cap["ok"] and cap.get("image")) else []
+        print(f"  检查: 歪的被拒 {len(tilted)}/3, 正的流式判定合格 {len(streak_ok)}/4, "
+              f"高清帧回传图 {len(accepted)}/1")
+        if not tilted or not streak_ok or not accepted:
             ok_all = False
             print("  !! 不符合预期")
 
@@ -195,8 +224,9 @@ async def main():
             got = await run_mode(ws, "face", [blank, blank] + [near] * 4,
                                  "人脸：空 2 帧 -> 真实人脸(凑近) 4 帧")
             no_face = [m for m in got[:2] if not m["ok"] and m["reason"] == "no_face"]
-            face_ok = [m for m in got[2:] if m["ok"] and m.get("image")]
-            print(f"  检查: 空画面判无人脸 {len(no_face)}/2, 检到人脸并回传裁图 {len(face_ok)}/4"
+            cap = await do_capture(ws, near, "face")   # 必须用人脸帧，别误用上个场景的 frames
+            face_ok = [cap] if (cap["ok"] and cap.get("image")) else []
+            print(f"  检查: 空画面判无人脸 {len(no_face)}/2, 高清帧回传裁图 {len(face_ok)}/1"
                   f" (前1帧防抖不回传属正常)")
             if not no_face or not face_ok:
                 ok_all = False
