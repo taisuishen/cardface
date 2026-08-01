@@ -99,7 +99,10 @@
 </div>
 
 <script>
-const FPS         = 3;            // 每秒发送帧数
+// 流式帧只有 7KB，10fps 也才 70KB/s，上行成本可忽略。
+// "凑够连续合格帧"的等待 = 帧数 × 帧间隔，10fps 下 3 帧只要 300ms
+// （3fps 时是 1000ms）。GPU 单帧 24~40ms ≈ 25fps 处理能力，10fps 不会被丢帧。
+const FPS         = 10;           // 每秒发送帧数
 
 // 两级分辨率：
 //   流式帧只用来做姿态判定和实时提示 —— 实测把长边从 960 降到 416、质量降到 60，
@@ -108,16 +111,18 @@ const FPS         = 3;            // 每秒发送帧数
 //   高清帧只在"连续 N 帧合格"后传一次，用来出最终裁图 —— 回传的证件图是从
 //   上传帧透视矫正来的，这一张必须够清晰，否则 OCR 会受影响。
 const STREAM_LONG = 416, STREAM_Q  = 0.60;   // 约 7KB
-// 高清帧质量：真实照片实测 q92=106KB / q82=70KB(省34%, PSNR 41.6dB 视觉无差别)。
-// 证件细节比普通照片还多（细纹、防伪底纹），真机上 q92 实测到过 177KB，
-// 手机 4G 上行 0.3MB/s 传这个要 0.6 秒，纯属浪费。q82 对 OCR 完全够用。
-const CAP_LONG    = 960, CAP_Q     = 0.82;
-const CAP_MAX_KB  = 110;          // 高清帧体积上限，超了自动降质量重编一次
+// 高清帧质量：真实照片实测 q92=106KB / q82=70KB / q75=58KB，
+// PSNR 依次 44.3 / 41.6 / 40.2 dB —— q75 对 OCR 仍然够用。
+// 体积在这里直接等于时间：RunPod 代理实测有效吞吐只有约 94KB/s，
+// 每省 10KB 就省 ~100ms。真机上 q92 曾到过 177KB（≈1.9 秒纯上传）。
+const CAP_LONG    = 960, CAP_Q     = 0.75;
+const CAP_MAX_KB  = 90;           // 高清帧体积上限，超了自动降质量重编
 
 // 连续几帧合格后自动上传高清帧。
-// 证件要 3 帧：四角回归对手抖敏感，多确认几帧能避免抓到正在移动的一帧。
-// 人脸只要 1 帧：判定项（大小/角度/清晰度）本身就已经把不合格的挡掉了，
-// 再等 3 帧纯属拖慢体验。
+// 证件 3 帧：避免抓到正在移动的那一瞬。10fps 下这 3 帧只花 300ms，
+// 不再是延迟瓶颈，所以没必要为了快而降到 2 帧。
+// （另外高清帧到服务端还会被【无状态严格重判】，抓歪了照样拒且不闭锁。）
+// 人脸 1 帧：大小/角度/清晰度这些判定项本身已经挡掉不合格的了。
 const CAPTURE_AFTER_BY_MODE = { card: 3, face: 1 };
 function captureAfter(){ return CAPTURE_AFTER_BY_MODE[mode] || 1; }
 
@@ -125,7 +130,7 @@ function captureAfter(){ return CAPTURE_AFTER_BY_MODE[mode] || 1; }
 //
 // 阈值 = 最多容忍多少排队延迟。积压 B 字节、上行 U 字节/秒，新帧就要多等 B/U 秒。
 // 手机上行常只有 ~300KB/s，所以按"最多 ~100ms 排队"取值：
-// 流式帧只有 7KB，3 帧 ≈ 21KB ≈ 70ms，很合适。
+// 流式帧只有 7KB，24KB ≈ 3.4 帧 ≈ 80ms，10fps 下仍然合适。
 // （注意别按 100KB 的老尺寸去算，那样 3 帧就是 1 秒排队，比一帧一答还慢。）
 const MAX_BUFFERED= 24 * 1024;
 
@@ -273,7 +278,6 @@ async function openCam(){
     if (cached){
       useId = cached;
     } else {
-      banner('正在识别视角最大的后置镜头…（只做一次）', 'wait');
       useId = await pickWidestBackCamera();
       if (useId){ try { localStorage.setItem(MAIN_CAM_KEY, useId); } catch(e){} }
     }
@@ -517,7 +521,6 @@ async function sendCapture(){
     if (!blob || blob.size / 1024 <= CAP_MAX_KB) break;
   }
   if (!blob){ capturing = false; return; }
-  banner('已对准，正在上传高清图…', 'wait');
   ws.send(JSON.stringify({type:'capture'}));
   capSentAt = performance.now();
   ws.send(await blob.arrayBuffer());
@@ -575,7 +578,6 @@ async function start(){
   sent = 0; got = 0; dropped = 0; okStreak = 0; capturing = false; t0 = performance.now();
   clearInterval(timer);
   timer = setInterval(tick, 1000/FPS);
-  banner('识别中…', 'wait');
 }
 function stop(){ clearInterval(timer); timer = null; }
 
