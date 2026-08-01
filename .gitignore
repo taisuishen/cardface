@@ -1,6 +1,8 @@
 certs/
 selftest_out/
 testdata/
+dumps/
 __pycache__/
 *.pyc
-app.log
+*.log
+.venv/

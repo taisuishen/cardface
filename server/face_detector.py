@@ -27,7 +27,6 @@ class FaceRule:
     max_yaw_ratio: float = 0.30       # 鼻子相对双眼中点的水平偏移比例（侧脸）
     margin_ratio: float = 0.0         # 人脸框允许贴边的比例
     crop_expand: float = 0.35         # 裁人脸时向外扩张的比例
-    stable_frames: int = 2
     # "清晰"闸门：把人脸区域缩到 128x128 后算拉普拉斯方差，越小越糊。
     #
     # 默认取 20，只挡明显不可用的帧。这个值是照着实测曲线定的

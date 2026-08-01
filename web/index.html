@@ -138,6 +138,7 @@ let mode = 'card', facing = 'environment', deviceId = '';   // deviceId 为空 =
 let sent = 0, got = 0, dropped = 0, lastSentAt = 0, capSentAt = 0, lastCloseCode = 0;
 let okStreak = 0;        // 连续合格帧数，达到 CAPTURE_AFTER 就补传高清帧
 let capturing = false;   // 高清帧在途，期间暂停推流
+let zoomApplied = null;  // 已归一到的 zoom 倍数（不支持则为 null）
 let last = null;   // 最近一次结果，用于画框
 let viewW = 0, viewH = 0;   // 取景区的 CSS 像素尺寸（画框坐标就用这个坐标系）
 
@@ -159,6 +160,95 @@ function layout(){
 addEventListener('resize', layout);
 v.addEventListener('loadedmetadata', layout);
 
+/* ---------------- 自动挑后置主摄 ----------------
+
+   Web 端【没有】任何 API 能表达"用系统相机默认那颗镜头、默认那个倍数"。
+   facingMode:'environment' 只保证是后置 —— 多摄手机上 Android Chrome 会把每颗
+   物理镜头都枚举成独立设备（主摄/超广角/长焦/景深），浏览器常按枚举顺序挑，
+   很容易给到超广角或景深镜头。iOS Safari 只暴露一个逻辑后置相机、内部自动切，
+   所以这基本是 Android 的问题。
+
+   这里逐个打开候选、按能力打分，判据按可靠性排序：
+     1) zoom 范围包含 1 且跨度最大的优先 —— 那通常是【逻辑相机】，
+        行为最接近原生（内部自动切镜头），而且把它归一到 zoom=1 就是原生的 1×。
+        注意别写成"zoom 下限<1 就是超广角"：逻辑相机的范围恰恰是 0.5~10，
+        那样会把最该选的那颗罚掉；独立枚举的物理超广角报的是它自己的 1~4。
+     2) 最大分辨率越高越可能是主摄 —— 超广角/景深通常给不出主摄的分辨率
+     3) label 里的索引越小越可能是主摄 —— camera2 0 通常是主摄
+
+   ⚠ 判据 1 的 zoom 范围语义各家 ROM 不完全一致，我没有多摄安卓机可验证。
+   探测结果会 console.log 出来（也可以用 window.__camProbe 取），
+   真机上如果挑错了，把那份打分数据发出来就能据实修正排序规则。
+
+   探测要逐个开关摄像头，慢且屏幕会闪，所以结果缓存起来只做一次。
+   用户手动选过镜头的话完全不走这条路径。 */
+const MAIN_CAM_KEY = 'cardpose.mainBackCam.v1';
+
+async function pickMainBackCamera(){
+  let devs = [];
+  try {
+    devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  } catch(e){ return ''; }
+  if (devs.length <= 1) return '';         // 只有一颗（iOS 就是这样），没得挑
+
+  const backs = devs.filter(d => /back|rear|环境|后/i.test(d.label));
+  const pool  = backs.length ? backs : devs;
+  if (pool.length <= 1) return pool.length ? pool[0].deviceId : '';
+
+  const scored = [];
+  for (const d of pool){
+    let s = null;
+    try{
+      // 用高分辨率去问，才能比出各颗镜头的能力差异
+      s = await navigator.mediaDevices.getUserMedia({
+        video: { deviceId:{exact:d.deviceId}, width:{ideal:1920}, height:{ideal:1440} }
+      });
+      const t = s.getVideoTracks()[0];
+      const st = t.getSettings ? (t.getSettings() || {}) : {};
+      const caps = (t.getCapabilities && t.getCapabilities()) || {};
+      const z = (caps.zoom && typeof caps.zoom.min === 'number') ? caps.zoom : null;
+      scored.push({
+        id: d.deviceId,
+        label: d.label || '(未命名)',
+        idx: parseInt((String(d.label).match(/(\d+)/) || [, '99'])[1], 10),
+        pixels: ((caps.width && caps.width.max) || st.width || 0)
+              * ((caps.height && caps.height.max) || st.height || 0),
+        zoom: z ? { min: z.min, max: z.max } : null,
+        // 能否归一到原生 1×，以及 zoom 跨度（跨度大 = 逻辑相机）
+        canBe1x: !!(z && z.min <= 1 && z.max >= 1),
+        zoomSpan: z ? (z.max - z.min) : 0,
+      });
+    }catch(e){ /* 这颗打不开就跳过 */ }
+    finally { if (s) s.getTracks().forEach(t => t.stop()); }
+  }
+  if (!scored.length) return '';
+
+  scored.sort((a, b) => {
+    if (a.canBe1x !== b.canBe1x) return a.canBe1x ? -1 : 1;   // 能归一到 1× 的优先
+    if (b.zoomSpan !== a.zoomSpan) return b.zoomSpan - a.zoomSpan;  // 跨度大=逻辑相机
+    if (b.pixels !== a.pixels) return b.pixels - a.pixels;
+    return a.idx - b.idx;
+  });
+  window.__camProbe = scored;      // 真机排查用：控制台里直接看
+  console.log('[cam] 主摄探测打分（第一个是选中的）', scored);
+  return scored[0].id;
+}
+
+/* 把 zoom 归一到 1.0 —— 逻辑相机上 zoom=1 就等于原生相机的 1×。
+   这是最接近"系统默认倍数"的手段。只有 Chrome Android 支持 zoom 约束，
+   iOS Safari 不支持，所以全程用可选调用保护。 */
+async function normalizeZoom(track){
+  try{
+    const caps = track.getCapabilities && track.getCapabilities();
+    if (!caps || !caps.zoom) return null;
+    if (caps.zoom.min <= 1 && caps.zoom.max >= 1){
+      await track.applyConstraints({ advanced: [{ zoom: 1 }] });
+      return 1;
+    }
+  }catch(e){}
+  return null;
+}
+
 /* ---------------- 摄像头 ---------------- */
 async function openCam(){
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
@@ -168,23 +258,49 @@ async function openCam(){
   }
   stop();
   if (stream) stream.getTracks().forEach(t => t.stop());
-  // 指定了 deviceId 就用它（exact，选错不如报错），否则按前置/后置让浏览器挑
-  const vid = deviceId
-    ? { deviceId:{exact:deviceId}, width:{ideal:1280}, height:{ideal:960} }
+
+  // 自动档 + 后置时，用探测出的主摄。缓存过就直接用，没有才探一次。
+  let useId = deviceId;
+  if (!useId && facing === 'environment'){
+    let cached = null;
+    try { cached = localStorage.getItem(MAIN_CAM_KEY); } catch(e){}
+    if (cached){
+      useId = cached;
+    } else {
+      banner('正在识别后置主摄像头…（只做一次）', 'wait');
+      useId = await pickMainBackCamera();
+      if (useId){ try { localStorage.setItem(MAIN_CAM_KEY, useId); } catch(e){} }
+    }
+  }
+
+  const vid = useId
+    ? { deviceId:{exact:useId}, width:{ideal:1280}, height:{ideal:960}, resizeMode:'none' }
     : { facingMode:{ideal:facing}, width:{ideal:1280}, height:{ideal:960} };
   try{
     stream = await navigator.mediaDevices.getUserMedia({ video: vid, audio:false });
   }catch(e){
-    if (deviceId){          // 这个摄像头打不开就退回自动，不要卡死
-      deviceId = '';
-      return openCam();
+    // 指定的那颗打不开（换机后缓存失效、或被别的应用占用）就退回自动档，别卡死
+    if (!useId){
+      showErr('打开摄像头失败：<code>' + e.name + ' ' + e.message + '</code>'
+        + '<br>请检查浏览器是否已授予相机权限。');
+      return false;
     }
-    showErr('打开摄像头失败：<code>' + e.name + ' ' + e.message + '</code>'
-      + '<br>请检查浏览器是否已授予相机权限。');
-    return false;
+    if (useId !== deviceId){ try { localStorage.removeItem(MAIN_CAM_KEY); } catch(e2){} }
+    deviceId = '';
+    try{
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode:{ideal:facing}, width:{ideal:1280}, height:{ideal:960} },
+        audio: false,
+      });
+    }catch(e3){
+      showErr('打开摄像头失败：<code>' + e3.name + ' ' + e3.message + '</code>'
+        + '<br>请检查浏览器是否已授予相机权限。');
+      return false;
+    }
   }
   v.srcObject = stream;
   await v.play().catch(()=>{});
+  zoomApplied = await normalizeZoom(stream.getVideoTracks()[0]);
   layout();
   hideErr();
   await listCams();
@@ -204,6 +320,7 @@ async function listCams(){
   sel.innerHTML = '';
   const auto = new Option('摄像头：自动（' + (facing === 'user' ? '前置' : '后置') + '）', '');
   sel.appendChild(auto);
+  sel.appendChild(new Option('↻ 重新探测后置主摄', '__reprobe__'));
   ds.forEach((d, i) => {
     const o = new Option(d.label || ('摄像头 ' + (i + 1)), d.deviceId);
     sel.appendChild(o);
@@ -212,7 +329,9 @@ async function listCams(){
 
   const st = cur && cur.getSettings ? cur.getSettings() : {};
   $('sCam').textContent = (cur ? (cur.label || '未命名') : '-')
-    + (st.width ? '  ' + st.width + '×' + st.height : '');
+    + (st.width ? '  ' + st.width + '×' + st.height : '')
+    + (zoomApplied ? '  zoom=' + zoomApplied + 'x' : '')
+    + (deviceId ? '  [手动]' : '  [自动挑主摄]');
   // 自动档时也把当前实际用的设备高亮出来，方便知道系统选了哪一个
   if (!deviceId && curId){
     const hit = [...sel.options].find(o => o.value === curId);
@@ -482,6 +601,13 @@ $('btnRec').onclick = () => {
 
 // 手动选摄像头（很多手机后置有主摄/广角/长焦多颗，自动档不一定挑到清晰的那颗）
 $('camSel').onchange = async () => {
+  if ($('camSel').value === '__reprobe__'){
+    try { localStorage.removeItem(MAIN_CAM_KEY); } catch(e){}
+    deviceId = ''; facing = 'environment';
+    const run = !!timer; stop();
+    if (await openCam() && run) start();
+    return;
+  }
   deviceId = $('camSel').value;
   const run = !!timer; stop();
   if (await openCam() && run) start();

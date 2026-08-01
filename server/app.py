@@ -115,7 +115,7 @@ def _b64(data: bytes) -> str:
 
 
 # ------------------------------------------------------------------ 同步处理
-def process_card(bgr: np.ndarray, stable: int, tracker: CardTracker) -> tuple[dict, int]:
+def process_card(bgr: np.ndarray, tracker: CardTracker) -> dict:
     """流式帧：只出判定和画框坐标，不回图。
 
     客户端推的是小图（约 7KB），只够做姿态判定和实时提示；
@@ -128,7 +128,7 @@ def process_card(bgr: np.ndarray, stable: int, tracker: CardTracker) -> tuple[di
         "area_ratio": r.area_ratio, "aspect": r.aspect, "quad": r.quad,
         "raw_quad": r.raw_quad, "jitter": r.jitter, "held": r.held, "votes": r.votes,
     }
-    return payload, (stable + 1 if r.ok else 0)
+    return payload
 
 
 def process_capture(bgr: np.ndarray, mode: str) -> dict:
@@ -170,7 +170,7 @@ def process_capture(bgr: np.ndarray, mode: str) -> dict:
     return payload
 
 
-def process_face(bgr: np.ndarray, stable: int) -> tuple[dict, int]:
+def process_face(bgr: np.ndarray) -> dict:
     """流式帧：只出判定，不回图（同 process_card）。"""
     r = face_det.judge(bgr)
     payload = {
@@ -179,7 +179,7 @@ def process_face(bgr: np.ndarray, stable: int) -> tuple[dict, int]:
         "roll_deg": r.roll_deg, "yaw_ratio": r.yaw_ratio,
         "area_ratio": r.area_ratio, "count": r.count, "sharp": r.sharp,
     }
-    return payload, (stable + 1 if r.ok else 0)
+    return payload
 
 
 # ------------------------------------------------------------------ WebSocket
@@ -194,8 +194,6 @@ class Conn:
         self.closed = False
         self.seq = 0
         self.dropped = 0
-        self.stable_card = 0
-        self.stable_face = 0
         self.tracker = CardTracker(card_det)   # 时域平滑是有状态的，必须每连接一份
         self.rec_left = 0                      # 还要录几帧
         self.rec_dir: str | None = None
@@ -230,7 +228,6 @@ class Conn:
         self.pending = None
         self.capture = None
         self.expect_capture = False
-        self.stable_card = self.stable_face = 0
         self.tracker.reset()
 
     async def worker(self):
@@ -260,11 +257,10 @@ class Conn:
                     payload = await loop.run_in_executor(
                         None, process_capture, bgr, mode)
                 elif mode == "face":
-                    payload, self.stable_face = await loop.run_in_executor(
-                        None, process_face, bgr, self.stable_face)
+                    payload = await loop.run_in_executor(None, process_face, bgr)
                 else:
-                    payload, self.stable_card = await loop.run_in_executor(
-                        None, process_card, bgr, self.stable_card, self.tracker)
+                    payload = await loop.run_in_executor(
+                        None, process_card, bgr, self.tracker)
                 payload.update(type="result", seq=seq, dropped=dropped,
                                ms=round((time.perf_counter() - t0) * 1000, 1),
                                frame_size=[bgr.shape[1], bgr.shape[0]],
@@ -319,8 +315,6 @@ async def ws_endpoint(ws: WebSocket):
         "type": "hello", "mode": conn.mode,
         "card_providers": card_det.providers, "imgsz": card_det.imgsz,
         "face_backend": face_det.backend,
-        "card_stable_frames": card_det.rule.stable_frames,
-        "face_stable_frames": face_det.rule.stable_frames,
         "active": len(ACTIVE), "capacity": MAX_USERS,
     }, ensure_ascii=False))
 

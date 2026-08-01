@@ -50,7 +50,6 @@ class PoseRule:
     border_ratio: float = _envf("BORDER", 0.04)         # 角点"贴边"判定比例，见 judge()
     min_aspect: float = 1.30                            # 矫正后宽高比区间（身份证≈1.585）
     max_aspect: float = 1.90
-    stable_frames: int = int(_envf("STABLE_FRAMES", 2)) # 连续几帧合格才回传，防抖
 
 
 CARD_W, CARD_H = 856, 540             # 输出证件图尺寸（ID-1 标准 85.6x54mm）

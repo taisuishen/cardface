@@ -1,0 +1,11 @@
+# shell 脚本强制 LF。在 Windows 上开发、Linux(RunPod) 上运行时，
+# 如果 git 把它转成 CRLF，bash 会报 $'\r': command not found —— 很难一眼看出原因。
+*.sh text eol=lf
+
+# PowerShell 脚本只在 Windows 跑，保持 CRLF
+*.ps1 text eol=crlf
+
+# 模型是二进制，别做任何行尾转换（否则文件会被改坏）
+*.onnx binary
+*.jpg  binary
+*.png  binary
