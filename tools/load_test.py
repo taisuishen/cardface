@@ -76,6 +76,10 @@ class Client:
                                 continue
                             self.got += 1
                             self.dropped += m.get("dropped", 0)
+                            # 压测要测"持续吞吐"，但服务端抓到合格结果会闭锁。
+                            # 收到 final 就立刻 reset，让它继续处理后面的帧。
+                            if m.get("final"):
+                                await ws.send(json.dumps({"type": "reset"}))
                             if "ms" in m:
                                 self.ms.append(m["ms"])
                             t0 = pending.pop(m.get("seq", -1), None)

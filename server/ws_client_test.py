@@ -105,6 +105,9 @@ def draw_face(W=960, H=720):
 
 
 async def run_mode(ws, mode, frames, label):
+    # 服务端是"一次性抓拍"：出过合格结果就闭锁、不再回消息。
+    # 每个场景开始前先 reset 解锁，否则第二个场景就一条回复也收不到。
+    await ws.send(json.dumps({"type": "reset"}))
     await ws.send(json.dumps({"type": "config", "mode": mode}))
     print(f"\n--- {label} (mode={mode}, {FPS}fps) ---")
     got, saved = [], 0
@@ -122,7 +125,7 @@ async def run_mode(ws, mode, frames, label):
         except asyncio.TimeoutError:
             break
         m = json.loads(raw)
-        if m.get("type") in ("config_ok", "pong", "hello"):
+        if m.get("type") in ("config_ok", "pong", "hello", "reset_ok"):
             continue
         got.append(m)
         img_kb = len(m.get("image", "")) * 3 / 4 / 1024 if m.get("image") else 0

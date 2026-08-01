@@ -28,6 +28,20 @@ class FaceRule:
     margin_ratio: float = 0.0         # 人脸框允许贴边的比例
     crop_expand: float = 0.35         # 裁人脸时向外扩张的比例
     stable_frames: int = 2
+    # "清晰"闸门：把人脸区域缩到 128x128 后算拉普拉斯方差，越小越糊。
+    #
+    # 默认取 20，只挡明显不可用的帧。这个值是照着实测曲线定的
+    # （样图是放大裁切的人脸，本身偏软，所以绝对值偏低）：
+    #     原图 44.5 | 高斯σ=2 25.1 | σ=4 16.6 | σ=8 8.0 | 运动模糊k=15 25.9
+    # 真机清晰自拍通常远高于这个范围（上百），所以 15 几乎不会误挡，
+    # 但能拦住严重失焦/大幅手抖的帧。
+    #
+    # 每帧实测值都会在 sharp 字段回传，前端状态表也显示。真机跑一轮看看
+    # 清晰帧和糊帧各是多少，再用 FACE_MIN_SHARP 调到两者之间即可。
+    #
+    # 逃生开关：真机上如果一直卡在"画面不清晰"，先 FACE_MIN_SHARP=0 关掉这道闸门，
+    # 记下状态表里清晰帧的实际数值，再设成它的一半左右。
+    min_sharpness: float = float(os.environ.get("FACE_MIN_SHARP", "20"))
 
 
 REASON_TEXT = {
@@ -38,6 +52,7 @@ REASON_TEXT = {
     "out_of_frame": "人脸超出画面，请居中",
     "rolled": "请把头摆正",
     "yawed": "请正对镜头，不要侧脸",
+    "blurry": "画面不清晰，请拿稳手机等对焦完成",
 }
 
 
@@ -53,6 +68,7 @@ class FaceResult:
     yaw_ratio: float = 0.0
     area_ratio: float = 0.0
     count: int = 0
+    sharp: float = 0.0        # 人脸区域拉普拉斯方差，越大越清晰
     face_jpeg: bytes | None = None
     stable: int = 0
 
@@ -165,12 +181,23 @@ class FaceDetector:
             eye_cx, eye_dist = (rx + lx) / 2, max(abs(lx - rx), 1e-6)
             yaw = abs(nx - eye_cx) / eye_dist
 
+        # 清晰度：只在人脸框内算，避免背景的高频纹理把分数抬上去。
+        # 归一化到脸的尺寸之后再算，否则脸越大方差越高，阈值就没法固定。
+        fx0, fy0 = max(0, int(x)), max(0, int(y))
+        fx1, fy1 = min(W, int(x + w)), min(H, int(y + h))
+        sharp = 0.0
+        if fx1 - fx0 > 8 and fy1 - fy0 > 8:
+            face = cv2.cvtColor(bgr[fy0:fy1, fx0:fx1], cv2.COLOR_BGR2GRAY)
+            face = cv2.resize(face, (128, 128), interpolation=cv2.INTER_AREA)
+            sharp = float(cv2.Laplacian(face, cv2.CV_64F).var())
+
         def res(ok, reason):
             return FaceResult(ok, reason, REASON_TEXT.get(reason, "请对准人脸"),
                               conf=round(score, 3), box=box,
                               landmarks=[[round(a, 1), round(b, 1)] for a, b in (lm or [])],
                               roll_deg=round(roll, 2), yaw_ratio=round(yaw, 3),
-                              area_ratio=round(area_ratio, 4), count=len(faces))
+                              area_ratio=round(area_ratio, 4), count=len(faces),
+                              sharp=round(sharp, 1))
 
         mx, my = W * R.margin_ratio, H * R.margin_ratio
         if x < -mx or y < -my or x + w > W + mx or y + h > H + my:
@@ -184,6 +211,8 @@ class FaceDetector:
                 return res(False, "rolled")
             if yaw > R.max_yaw_ratio:
                 return res(False, "yawed")
+        if sharp < R.min_sharpness:
+            return res(False, "blurry")
 
         r = res(True, "ok")
         r.msg = "检测到人脸"

@@ -49,6 +49,13 @@ DUMP_ROOT = os.environ.get("DUMP_DIR", os.path.join(ROOT, "dumps"))
 card_det: CardPoseDetector | None = None
 face_det: FaceDetector | None = None
 
+# 并发上限（过载保护）。实测单卡 24 并发持续推流丢帧 0.3%、32 并发 5%，
+# 所以默认留余量取 20。超过就用 close code 4429 拒掉新连接。
+MAX_USERS = int(os.environ.get("MAX_USERS", "20"))
+
+ACTIVE: set = set()          # 当前活跃连接
+_recent_ms: list = []        # 最近若干帧的服务端耗时，给 /stats 算分位用
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -72,6 +79,29 @@ def health():
         "card_providers": card_det.providers if card_det else [],
         "card_imgsz": card_det.imgsz if card_det else None,
         "face_backend": face_det.backend if face_det else None,
+        "gpu": bool(card_det and "CUDAExecutionProvider" in card_det.providers),
+        "active": len(ACTIVE),
+        "capacity": MAX_USERS,
+    })
+
+
+@app.get("/stats")
+def stats():
+    """运维/监控用：当前并发、容量、真实处理耗时分位。"""
+    ms = sorted(_recent_ms)
+    active = len(ACTIVE)
+    return JSONResponse({
+        "ok": card_det is not None,
+        "gpu": bool(card_det and "CUDAExecutionProvider" in card_det.providers),
+        "active": active,
+        "capacity": MAX_USERS,
+        "load": round(active / MAX_USERS, 3) if MAX_USERS else 1.0,
+        "accepting": card_det is not None and active < MAX_USERS,
+        # 真实处理耗时比连接数更能反映压力：连接数没满但 p95 已经很高，
+        # 说明 GPU 被别的负载抢了。
+        "ms_p50": round(ms[len(ms) // 2], 1) if ms else None,
+        "ms_p95": round(ms[int(len(ms) * 0.95)], 1) if ms else None,
+        "samples": len(ms),
     })
 
 
@@ -118,7 +148,7 @@ def process_face(bgr: np.ndarray, stable: int) -> tuple[dict, int]:
         "mode": "face", "ok": False, "reason": r.reason, "msg": r.msg,
         "conf": r.conf, "box": r.box, "landmarks": r.landmarks,
         "roll_deg": r.roll_deg, "yaw_ratio": r.yaw_ratio,
-        "area_ratio": r.area_ratio, "count": r.count,
+        "area_ratio": r.area_ratio, "count": r.count, "sharp": r.sharp,
     }
     if not r.ok:
         return payload, 0
@@ -154,12 +184,27 @@ class Conn:
         self.tracker = CardTracker(card_det)   # 时域平滑是有状态的，必须每连接一份
         self.rec_left = 0                      # 还要录几帧
         self.rec_dir: str | None = None
+        self.done = False                      # 已抓到合格结果，闭锁；收 reset 才解开
+        self.ignored = 0                       # 闭锁后忽略掉的帧数
 
     def submit(self, data: bytes):
+        # 一次性抓拍：已经出过合格结果就彻底不再处理，也不回消息。
+        # 客户端理应收到 final 后就停发，这里是兜底（网络在途的帧、或客户端没停）。
+        if self.done:
+            self.ignored += 1
+            return
         if self.pending is not None:
             self.dropped += 1          # 上一帧还没处理完，丢掉它
         self.pending = data
         self.event.set()
+
+    def unlock(self):
+        """重新开始一次抓拍。"""
+        self.done = False
+        self.ignored = 0
+        self.pending = None
+        self.stable_card = self.stable_face = 0
+        self.tracker.reset()
 
     async def worker(self):
         loop = asyncio.get_running_loop()
@@ -189,6 +234,14 @@ class Conn:
                                ms=round((time.perf_counter() - t0) * 1000, 1),
                                frame_size=[bgr.shape[1], bgr.shape[0]],
                                bytes_in=len(data))
+                _recent_ms.append(payload["ms"])
+                del _recent_ms[:-200]          # 只留最近 200 个样本
+                # 一次性抓拍：这一帧合格且带回了图，就闭锁，后续帧不再处理
+                if payload.get("ok") and payload.get("image"):
+                    self.done = True
+                    self.pending = None
+                    payload["final"] = True
+                    print(f"[done] mode={mode} seq={seq} 已抓到合格结果，停止处理直到 reset")
             except Exception as e:                                   # noqa: BLE001
                 payload = {"type": "error", "mode": mode, "seq": seq, "msg": str(e)}
 
@@ -218,8 +271,14 @@ class Conn:
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    # 先判容量再 accept —— 超限的连接不该占用任何资源
+    if len(ACTIVE) >= MAX_USERS:
+        await ws.close(code=4429)                      # 自定义：并发已满
+        return
+
     await ws.accept()
     conn = Conn(ws)
+    ACTIVE.add(conn)
     task = asyncio.create_task(conn.worker())
     await ws.send_text(json.dumps({
         "type": "hello", "mode": conn.mode,
@@ -227,6 +286,7 @@ async def ws_endpoint(ws: WebSocket):
         "face_backend": face_det.backend,
         "card_stable_frames": card_det.rule.stable_frames,
         "face_stable_frames": face_det.rule.stable_frames,
+        "active": len(ACTIVE), "capacity": MAX_USERS,
     }, ensure_ascii=False))
 
     try:
@@ -245,8 +305,7 @@ async def ws_endpoint(ws: WebSocket):
                     m = cmd.get("mode")
                     if m in ("card", "face") and m != conn.mode:
                         conn.mode = m
-                        conn.stable_card = conn.stable_face = 0
-                        conn.tracker.reset()
+                        conn.unlock()          # 换模式相当于重新开一次抓拍
                         await ws.send_text(json.dumps(
                             {"type": "config_ok", "mode": m}, ensure_ascii=False))
                 elif cmd.get("type") == "record":
@@ -258,13 +317,16 @@ async def ws_endpoint(ws: WebSocket):
                     await ws.send_text(json.dumps(
                         {"type": "record_started", "n": n, "dir": d}, ensure_ascii=False))
                 elif cmd.get("type") == "reset":
-                    conn.stable_card = conn.stable_face = 0
-                    conn.tracker.reset()
+                    ign = conn.ignored
+                    conn.unlock()              # 解开闭锁，可以重新抓一次
+                    await ws.send_text(json.dumps(
+                        {"type": "reset_ok", "ignored": ign}, ensure_ascii=False))
                 elif cmd.get("type") == "ping":
                     await ws.send_text(json.dumps({"type": "pong"}))
     except WebSocketDisconnect:
         pass
     finally:
+        ACTIVE.discard(conn)
         conn.closed = True
         conn.event.set()
         task.cancel()

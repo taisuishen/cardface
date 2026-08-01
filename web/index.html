@@ -63,6 +63,7 @@
 <div class="panel">
   <div class="row">
     <button id="btnStart" class="btn pri">开始</button>
+    <button id="btnAgain" class="btn pri" style="display:none">重新识别</button>
     <button id="btnStop" class="btn">停止</button>
     <button id="btnCam" class="btn">前/后切换</button>
   </div>
@@ -82,7 +83,7 @@
     <table>
       <tr><td>连接</td><td id="sWs">未连接</td></tr>
       <tr><td>模式</td><td id="sMode">card</td></tr>
-      <tr><td>发送帧率 / 丢帧</td><td id="sFps">-</td></tr>
+      <tr><td>发送/回传帧率 丢帧</td><td id="sFps">-</td></tr>
       <tr><td>上传大小</td><td id="sSize">-</td></tr>
       <tr><td>服务端耗时</td><td id="sMs">-</td></tr>
       <tr><td>往返延迟</td><td id="sRtt">-</td></tr>
@@ -100,8 +101,9 @@
 const FPS         = 3;            // 每秒发送帧数
 const TARGET_KB   = 100;          // 目标单帧大小
 const LONG_SIDE   = 960;          // 上传图长边（与模型输入一致）
-const MAX_INFLIGHT= 1;            // 未收到结果时最多在途帧数（背压）
-const STALL_MS    = 4000;         // 超过这么久没收到结果就放弃等待，继续发新帧
+// 背压：只看"还没发出去的字节数"，不看有没有收到结果。
+// 约 3 帧的量；超了说明上行堵住了，跳过这一帧（服务端反正只处理最新的）。
+const MAX_BUFFERED= 3 * TARGET_KB * 1024;
 
 const $ = id => document.getElementById(id);
 const v = $('v'), ov = $('ov'), ctx = ov.getContext('2d');
@@ -109,7 +111,7 @@ const cap = document.createElement('canvas'), cctx = cap.getContext('2d');
 
 let ws = null, stream = null, timer = null, pingTimer = null;
 let mode = 'card', facing = 'environment', deviceId = '';   // deviceId 为空 = 按 facing 自动选
-let quality = 0.7, inflight = 0, sent = 0, dropped = 0, lastSentAt = 0;
+let quality = 0.7, sent = 0, got = 0, dropped = 0, lastSentAt = 0, lastCloseCode = 0;
 let last = null;   // 最近一次结果，用于画框
 let viewW = 0, viewH = 0;   // 取景区的 CSS 像素尺寸（画框坐标就用这个坐标系）
 
@@ -211,8 +213,10 @@ function connect(){
       }, 20000);
       res(true);
     };
-    ws.onclose = () => {
-      $('dot').classList.remove('on'); $('sWs').textContent = '已断开';
+    ws.onclose = (e) => {
+      lastCloseCode = e.code;          // 4429=并发已满
+      $('dot').classList.remove('on');
+      $('sWs').textContent = '已断开' + (e.code ? ' (' + e.code + ')' : '');
       clearInterval(pingTimer); stop(); res(false);
     };
     ws.onerror = () => { $('sWs').textContent = '连接错误'; };
@@ -229,13 +233,13 @@ function onMsg(m){
   if (m.type === 'config_ok'){ $('sMode').textContent = m.mode; return; }
   if (m.type === 'record_started'){ banner('正在录制 ' + m.n + ' 帧…', 'wait'); return; }
   if (m.type === 'error'){
-    inflight = Math.max(0, inflight-1);
+    got++;
     banner('服务端错误：' + m.msg, 'bad');
     return;
   }
   if (m.type !== 'result') return;
 
-  inflight = Math.max(0, inflight-1);
+  got++;
   last = m;
   dropped += (m.dropped || 0);
 
@@ -248,7 +252,7 @@ function onMsg(m){
   $('sJit').textContent = m.mode === 'card'
       ? (m.jitter != null ? m.jitter + ' px' : '-') + ' / ' + (m.votes || '-')
         + (m.held ? '  (漏检沿用上帧)' : '')
-      : '-';
+      : (m.sharp != null ? '清晰度 ' + m.sharp : '-');
   if (m.rec_done) banner('录制完成：' + m.rec_done, 'ok');
   $('sGeo').textContent = m.mode === 'card'
       ? (m.rotate_deg ?? '-') + '° / ' + (m.skew ?? '-')
@@ -260,6 +264,18 @@ function onMsg(m){
     $('shot').src = m.image; $('shot').style.display = 'block'; $('empty').style.display = 'none';
   }
   draw(m);
+
+  // 一次性抓拍：服务端标了 final 就立刻停止发送。
+  // 服务端那边也同时闭锁了，即使这里没停它也不会再处理、不会再回消息。
+  if (m.final) finish(m);
+}
+
+function finish(m){
+  stop();                                  // 停掉发送定时器（摄像头预览保留）
+  banner(m.mode === 'card' ? '✓ 证件已采集，已停止发送' : '✓ 人脸已采集，已停止发送', 'ok');
+  $('btnStart').style.display = 'none';
+  $('btnAgain').style.display = '';
+  $('sFps').textContent = fpsText() + '  已停止';
 }
 
 function banner(text, cls){ const b = $('banner'); b.textContent = text; b.className = cls; }
@@ -311,13 +327,21 @@ function grab(){
 async function tick(){
   if (!ws || ws.readyState !== 1) return;
 
-  // 看门狗：万一某帧的结果没回来（服务端异常/丢包），inflight 会一直卡住
-  // 导致后面再也不发帧。超过 STALL_MS 没收到结果就强制放行。
-  if (inflight > 0 && lastSentAt && performance.now() - lastSentAt > STALL_MS){
-    inflight = 0;
-    banner('响应超时，重试中…', 'bad');
+  // 连续发送，不等上一帧的结果。
+  //
+  // 之前这里是"一帧一答"（收到结果才发下一帧），等于把发送速率锁死成 1/RTT ——
+  // 实测往返 377ms，上限就只有 2.65fps，连 3fps 都跑不满，而服务端单帧只要 32ms。
+  // 服务端本身是 latest-wins（新帧覆盖没来得及处理的旧帧，见 Conn.submit），
+  // 所以多发不会在服务端排队堆积。
+  //
+  // 但不能无脑发：网络一差就会往浏览器的 WS 发送缓冲里无限堆积，越堆越延迟。
+  // 正确的背压信号是 bufferedAmount（还没发出去的字节数），它反映的是
+  // 【上行是否堵住】，跟 RTT 无关 —— 这才是我们真正要限制的东西。
+  if (ws.bufferedAmount > MAX_BUFFERED){
+    dropped++;
+    $('sFps').textContent = fpsText();
+    return;
   }
-  if (inflight >= MAX_INFLIGHT){ dropped++; $('sFps').textContent = fpsText(); return; }
 
   const blob = await grab();
   if (!blob) return;
@@ -328,29 +352,48 @@ async function tick(){
   else if (kb < TARGET_KB*0.75) quality = Math.min(0.92, quality + 0.04);
 
   ws.send(await blob.arrayBuffer());
-  inflight++; sent++; lastSentAt = performance.now();
+  sent++; lastSentAt = performance.now();
   $('sFps').textContent = fpsText();
 }
 
 let t0 = 0;
 function fpsText(){
   const dt = (performance.now() - t0)/1000;
-  return (sent/Math.max(dt,.001)).toFixed(1) + ' fps / 丢 ' + dropped;
+  // 发送速率和回传速率分开看：一帧一答时两者被 RTT 锁在一起，
+  // 连续发送后发送速率应该稳定贴住 FPS，不再受 RTT 影响。
+  return (sent/Math.max(dt,.001)).toFixed(1) + ' / 回 '
+       + (got/Math.max(dt,.001)).toFixed(1) + ' fps / 丢 ' + dropped
+       + (ws && ws.bufferedAmount > 0 ? '  缓冲' + (ws.bufferedAmount/1024).toFixed(0) + 'KB' : '');
 }
 
 /* ---------------- 控制 ---------------- */
 async function start(){
   if (!stream && !(await openCam())) return;
-  if (!ws || ws.readyState > 1) { if (!(await connect())) return; }
-  sent = 0; dropped = 0; t0 = performance.now(); inflight = 0;
+  if (!ws || ws.readyState > 1){
+    if (!(await connect())){
+      banner(lastCloseCode === 4429 ? '服务当前连接数已满，请稍后重试' : '连接失败，请重试', 'bad');
+      return;
+    }
+  }
+  sent = 0; got = 0; dropped = 0; t0 = performance.now();
   clearInterval(timer);
   timer = setInterval(tick, 1000/FPS);
   banner('识别中…', 'wait');
 }
-function stop(){ clearInterval(timer); timer = null; inflight = 0; }
+function stop(){ clearInterval(timer); timer = null; }
 
 $('btnStart').onclick = start;
 $('btnStop').onclick  = () => { stop(); banner('已停止', 'wait'); };
+
+// 重新识别：先让服务端解开闭锁，再重新开始推流
+$('btnAgain').onclick = () => {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'reset'}));
+  $('btnAgain').style.display = 'none';
+  $('btnStart').style.display = '';
+  $('shot').style.display = 'none'; $('empty').style.display = 'block';
+  last = null; ctx.clearRect(0,0,viewW,viewH);
+  start();
+};
 $('btnCam').onclick   = async () => {
   facing = facing === 'environment' ? 'user' : 'environment';
   deviceId = '';                      // 回到自动档，交给浏览器按前/后置挑
@@ -378,6 +421,7 @@ function setMode(m){
   $('tabFace').classList.toggle('act', m==='face');
   $('sMode').textContent = m;
   $('shot').style.display='none'; $('empty').style.display='block';
+  $('btnAgain').style.display='none'; $('btnStart').style.display='';   // 换模式=重开一次抓拍
   last = null;
   ctx.clearRect(0,0,viewW,viewH);
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'config', mode:m}));
