@@ -56,16 +56,16 @@ CARD_W, CARD_H = 856, 540             # 输出证件图尺寸（ID-1 标准 85.6
 CARD_PAD = _envf("CARD_PAD", 0.03)    # 裁剪时四周多留一圈，只比证件本身大一点
 
 REASON_TEXT = {
-    "no_card": "未检测到证件，请将证件放入框内",
-    "tilted": "证件歪了，请对准证件",
-    "upside_down": "证件方向不对，请正向放置",
-    "skewed": "请正对镜头拍摄，不要斜着拍",
-    "not_rect": "请把证件放平，四角要清晰",
-    "too_small": "请靠近一点，让证件充满取景框",
-    "too_large": "请稍微拉远一点",
-    "out_of_frame": "证件超出画面，请对准证件",
-    "bad_aspect": "证件识别异常，请重新对准",
-    "unstable": "保持不动…",
+    "no_card": "No card detected. Place your card inside the frame",
+    "tilted": "Card is tilted. Align it with the frame",
+    "upside_down": "Card is the wrong way up. Turn it upright",
+    "skewed": "Face the camera straight on, do not shoot at an angle",
+    "not_rect": "Lay the card flat so all four corners are clear",
+    "too_small": "Move closer so the card fills the frame",
+    "too_large": "Move back a little",
+    "out_of_frame": "Card is out of frame. Align it with the frame",
+    "bad_aspect": "Card not recognized. Please align it again",
+    "unstable": "Hold still…",
 }
 
 
@@ -226,7 +226,7 @@ class CardPoseDetector:
         bad_aspect = not (R.min_aspect <= aspect <= R.max_aspect)
 
         def res(ok: bool, reason: str) -> CardResult:
-            return CardResult(ok, reason, REASON_TEXT.get(reason, "请对准证件"),
+            return CardResult(ok, reason, REASON_TEXT.get(reason, "Align the card with the frame"),
                               conf=conf, rotate_deg=round(rot, 2), skew=round(skew, 3),
                               corner_err=round(corner_err, 2),
                               area_ratio=round(area_ratio, 3), aspect=round(aspect, 3),
@@ -255,7 +255,7 @@ class CardPoseDetector:
             return res(False, "out_of_frame" if near_border else "bad_aspect")
 
         r = res(True, "ok")
-        r.msg = "证件已对准"
+        r.msg = "Card aligned"
         return r
 
     # ---------- 矫正裁剪 ----------
@@ -343,7 +343,7 @@ class CardTracker:
             r = self.det.judge_quad(self.sq, 0.0, W, H)
             r.ok = False
             if r.reason == "ok":
-                r.reason, r.msg = "unstable", "保持不动…"
+                r.reason, r.msg = "unstable", "Hold still…"
             self.votes.append(False)
             if len(self.votes) > self.s.vote_win:
                 self.votes.pop(0)
@@ -382,7 +382,7 @@ class CardTracker:
 
         r.ok = voted_ok
         if not voted_ok and r.reason == "ok":
-            r.reason, r.msg = "unstable", "保持不动…"
+            r.reason, r.msg = "unstable", "Hold still…"
         r.quad = [[round(float(x), 1), round(float(y), 1)] for x, y in self.sq]  # 画框用
         r.raw_quad = raw                                                        # 裁图用
         r.held = False
