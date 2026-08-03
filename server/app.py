@@ -56,27 +56,10 @@ MAX_USERS = int(os.environ.get("MAX_USERS", "20"))
 ACTIVE: set = set()          # 当前活跃连接
 _recent_ms: list = []        # 最近若干帧的服务端耗时，给 /stats 算分位用
 
-# 调试：把每条下行 WS 消息打到 stdout（image 字段只打长度，别刷屏）。
-# 关掉：WS_LOG=0
-WS_LOG = os.environ.get("WS_LOG", "1") != "0"
-
 
 async def _send(ws: WebSocket, obj: dict):
-    """发一条下行控制帧，顺带打日志。pong 太频繁，不打。"""
-    text = json.dumps(obj, ensure_ascii=False)
-    if WS_LOG and obj.get("type") != "pong":
-        _log_out(text)
-    await ws.send_text(text)
-
-
-def _log_out(text: str):
-    """打印下行帧。Windows 控制台常是 cp1252，遇到非 ASCII 会抛 —— 兜住，
-    顺便这样也能一眼看出消息里还有没有非 ASCII 字符。"""
-    try:
-        print("[ws->]", text, flush=True)
-    except UnicodeEncodeError:
-        enc = sys.stdout.encoding or "ascii"
-        print("[ws->]", text.encode(enc, "backslashreplace").decode(enc), flush=True)
+    """发一条下行控制帧。"""
+    await ws.send_text(json.dumps(obj, ensure_ascii=False))
 
 
 @asynccontextmanager
@@ -307,14 +290,8 @@ class Conn:
                 if self.rec_left == 0:
                     payload["rec_done"] = self.rec_dir
 
-            text = json.dumps(payload, ensure_ascii=False)
-            if WS_LOG:
-                # image 是几十 KB 的 base64，只报长度
-                brief = {k: (f"<{len(v)} chars>" if k == "image" else v)
-                         for k, v in payload.items()}
-                _log_out(json.dumps(brief, ensure_ascii=False))
             try:
-                await self.ws.send_text(text)
+                await self.ws.send_text(json.dumps(payload, ensure_ascii=False))
             except Exception:                                        # noqa: BLE001
                 self.closed = True
                 return
