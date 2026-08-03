@@ -44,14 +44,14 @@ class FaceRule:
 
 
 REASON_TEXT = {
-    "no_face": "未检测到人脸，请把脸放入框内",
-    "multi_face": "画面中有多张人脸，请只保留一人",
-    "too_small": "请靠近一点",
-    "too_large": "请稍微拉远一点",
-    "out_of_frame": "人脸超出画面，请居中",
-    "rolled": "请把头摆正",
-    "yawed": "请正对镜头，不要侧脸",
-    "blurry": "画面不清晰，请拿稳手机等对焦完成",
+    "no_face": "No face detected. Place your face inside the frame",
+    "multi_face": "Multiple faces detected. Only one person, please",
+    "too_small": "Move closer",
+    "too_large": "Move back a little",
+    "out_of_frame": "Face is out of frame. Center your face",
+    "rolled": "Keep your head straight",
+    "yawed": "Face the camera, do not turn sideways",
+    "blurry": "Image is blurry. Hold the phone steady until it focuses",
 }
 
 
@@ -191,7 +191,7 @@ class FaceDetector:
             sharp = float(cv2.Laplacian(face, cv2.CV_64F).var())
 
         def res(ok, reason):
-            return FaceResult(ok, reason, REASON_TEXT.get(reason, "请对准人脸"),
+            return FaceResult(ok, reason, REASON_TEXT.get(reason, "Align your face with the frame"),
                               conf=round(score, 3), box=box,
                               landmarks=[[round(a, 1), round(b, 1)] for a, b in (lm or [])],
                               roll_deg=round(roll, 2), yaw_ratio=round(yaw, 3),
@@ -214,7 +214,7 @@ class FaceDetector:
             return res(False, "blurry")
 
         r = res(True, "ok")
-        r.msg = "检测到人脸"
+        r.msg = "Face detected"
         return r
 
     # ---------- 裁剪 ----------
