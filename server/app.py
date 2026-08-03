@@ -56,6 +56,28 @@ MAX_USERS = int(os.environ.get("MAX_USERS", "20"))
 ACTIVE: set = set()          # 当前活跃连接
 _recent_ms: list = []        # 最近若干帧的服务端耗时，给 /stats 算分位用
 
+# 调试：把每条下行 WS 消息打到 stdout（image 字段只打长度，别刷屏）。
+# 关掉：WS_LOG=0
+WS_LOG = os.environ.get("WS_LOG", "1") != "0"
+
+
+async def _send(ws: WebSocket, obj: dict):
+    """发一条下行控制帧，顺带打日志。pong 太频繁，不打。"""
+    text = json.dumps(obj, ensure_ascii=False)
+    if WS_LOG and obj.get("type") != "pong":
+        _log_out(text)
+    await ws.send_text(text)
+
+
+def _log_out(text: str):
+    """打印下行帧。Windows 控制台常是 cp1252，遇到非 ASCII 会抛 —— 兜住，
+    顺便这样也能一眼看出消息里还有没有非 ASCII 字符。"""
+    try:
+        print("[ws->]", text, flush=True)
+    except UnicodeEncodeError:
+        enc = sys.stdout.encoding or "ascii"
+        print("[ws->]", text.encode(enc, "backslashreplace").decode(enc), flush=True)
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -285,8 +307,14 @@ class Conn:
                 if self.rec_left == 0:
                     payload["rec_done"] = self.rec_dir
 
+            text = json.dumps(payload, ensure_ascii=False)
+            if WS_LOG:
+                # image 是几十 KB 的 base64，只报长度
+                brief = {k: (f"<{len(v)} chars>" if k == "image" else v)
+                         for k, v in payload.items()}
+                _log_out(json.dumps(brief, ensure_ascii=False))
             try:
-                await self.ws.send_text(json.dumps(payload, ensure_ascii=False))
+                await self.ws.send_text(text)
             except Exception:                                        # noqa: BLE001
                 self.closed = True
                 return
@@ -311,12 +339,12 @@ async def ws_endpoint(ws: WebSocket):
     conn = Conn(ws)
     ACTIVE.add(conn)
     task = asyncio.create_task(conn.worker())
-    await ws.send_text(json.dumps({
+    await _send(ws, {
         "type": "hello", "mode": conn.mode,
         "card_providers": card_det.providers, "imgsz": card_det.imgsz,
         "face_backend": face_det.backend,
         "active": len(ACTIVE), "capacity": MAX_USERS,
-    }, ensure_ascii=False))
+    })
 
     try:
         while True:
@@ -335,8 +363,7 @@ async def ws_endpoint(ws: WebSocket):
                     if m in ("card", "face") and m != conn.mode:
                         conn.mode = m
                         conn.unlock()          # 换模式相当于重新开一次抓拍
-                        await ws.send_text(json.dumps(
-                            {"type": "config_ok", "mode": m}, ensure_ascii=False))
+                        await _send(ws, {"type": "config_ok", "mode": m})
                 elif cmd.get("type") == "capture":
                     # 紧跟其后的那个二进制帧按高清抓拍处理
                     conn.expect_capture = True
@@ -346,15 +373,13 @@ async def ws_endpoint(ws: WebSocket):
                     os.makedirs(d, exist_ok=True)
                     conn.rec_dir, conn.rec_left = d, n
                     print(f"[rec] 开始录制 {n} 帧 -> {d}")
-                    await ws.send_text(json.dumps(
-                        {"type": "record_started", "n": n, "dir": d}, ensure_ascii=False))
+                    await _send(ws, {"type": "record_started", "n": n, "dir": d})
                 elif cmd.get("type") == "reset":
                     ign = conn.ignored
                     conn.unlock()              # 解开闭锁，可以重新抓一次
-                    await ws.send_text(json.dumps(
-                        {"type": "reset_ok", "ignored": ign}, ensure_ascii=False))
+                    await _send(ws, {"type": "reset_ok", "ignored": ign})
                 elif cmd.get("type") == "ping":
-                    await ws.send_text(json.dumps({"type": "pong"}))
+                    await _send(ws, {"type": "pong"})
     except WebSocketDisconnect:
         pass
     finally:
