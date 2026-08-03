@@ -8,10 +8,10 @@
 
 服务端 -> 客户端
   {"type":"hello", "backend":..., "providers":[...], "imgsz":960}
-  {"type":"result","mode":"card","ok":true,"msg":"证件已对准","reason":"ok",
+  {"type":"result","mode":"card","ok":true,"msg":"Card aligned","reason":"ok",
    "conf":0.93,"rotate_deg":1.2,"skew":0.03,"quad":[[x,y]x4],
    "image":"data:image/jpeg;base64,...","ms":38,"seq":17,"dropped":2}
-  {"type":"result","mode":"card","ok":false,"msg":"证件歪了，请对准证件","reason":"tilted",...}
+  {"type":"result","mode":"card","ok":false,"msg":"Card is tilted. Align it with the frame","reason":"tilted",...}
   {"type":"error","msg":...}
 
 只有 ok=true 且连续稳定帧达标时才带 image 字段回传。
@@ -252,7 +252,7 @@ class Conn:
             try:
                 bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
                 if bgr is None:
-                    raise ValueError("JPEG 解码失败")
+                    raise ValueError("JPEG decode failed")
                 if is_cap:
                     payload = await loop.run_in_executor(
                         None, process_capture, bgr, mode)
