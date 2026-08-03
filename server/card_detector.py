@@ -65,7 +65,7 @@ REASON_TEXT = {
     "too_large": "Move back a little",
     "out_of_frame": "Card is out of frame. Align it with the frame",
     "bad_aspect": "Card not recognized. Please align it again",
-    "unstable": "Hold still…",
+    "unstable": "Hold still...",
 }
 
 
@@ -343,7 +343,7 @@ class CardTracker:
             r = self.det.judge_quad(self.sq, 0.0, W, H)
             r.ok = False
             if r.reason == "ok":
-                r.reason, r.msg = "unstable", "Hold still…"
+                r.reason, r.msg = "unstable", "Hold still..."
             self.votes.append(False)
             if len(self.votes) > self.s.vote_win:
                 self.votes.pop(0)
@@ -382,7 +382,7 @@ class CardTracker:
 
         r.ok = voted_ok
         if not voted_ok and r.reason == "ok":
-            r.reason, r.msg = "unstable", "Hold still…"
+            r.reason, r.msg = "unstable", "Hold still..."
         r.quad = [[round(float(x), 1), round(float(y), 1)] for x, y in self.sq]  # 画框用
         r.raw_quad = raw                                                        # 裁图用
         r.held = False
