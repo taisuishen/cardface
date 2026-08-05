@@ -73,9 +73,9 @@
   </div>
 
   <div class="card">
-    <h3>服务端回传的结果图</h3>
-    <img id="shot" alt="result">
-    <div id="empty">合格时这里显示矫正后的证件 / 人脸裁图</div>
+    <h3>上传的高清帧 <span id="shotSize"></span></h3>
+    <img id="shot" alt="uploaded">
+    <div id="empty">这里显示选中并上传的那一帧高清图</div>
   </div>
 
   <div class="card">
@@ -99,10 +99,17 @@
 </div>
 
 <script>
-// 流式帧只有 7KB，10fps 也才 70KB/s，上行成本可忽略。
-// "凑够连续合格帧"的等待 = 帧数 × 帧间隔，10fps 下 3 帧只要 300ms
-// （3fps 时是 1000ms）。GPU 单帧 24~40ms ≈ 25fps 处理能力，10fps 不会被丢帧。
-const FPS         = 10;           // 每秒发送帧数
+// "凑够连续合格帧"的等待 = 帧数 × 帧间隔，24fps 下 3 帧只要 125ms（10fps 时 300ms）。
+// 选帧窗口同样按帧间隔走，帧率越高候选越多、越可能挑到清晰的那张。
+//
+// 两个代价，都在可接受范围内：
+//   上行：流式帧 7KB × 24 = 168KB/s（10fps 时 70KB/s）。手机上行常有 ~300KB/s，
+//         够用；不够时 bufferedAmount 背压会自动丢帧，不会越堆越延迟。
+//   服务端：GPU 单帧 24~40ms ≈ 25~40fps，单连接 24fps 基本吃满一张卡。
+//         服务端是 latest-wins（新帧覆盖没处理完的旧帧），吃不下只会丢帧、
+//         不会排队堆积，但【多人并发时人均帧率会掉】—— MAX_USERS=20 那套
+//         容量估算是按 10fps 做的，真要多人同时用得重新压测。
+const FPS         = 24;           // 每秒发送帧数
 
 // 两级分辨率：
 //   流式帧只用来做姿态判定和实时提示 —— 实测把长边从 960 降到 416、质量降到 60，
@@ -112,14 +119,14 @@ const FPS         = 10;           // 每秒发送帧数
 //   上传帧透视矫正来的，这一张必须够清晰，否则 OCR 会受影响。
 const STREAM_LONG = 416, STREAM_Q  = 0.60;   // 约 7KB
 // 高清帧质量：真实照片实测 q92=106KB / q82=70KB / q75=58KB，
-// PSNR 依次 44.3 / 41.6 / 40.2 dB —— q75 对 OCR 仍然够用。
+// PSNR 依次 44.3 / 41.6 / 40.2 dB。按"约 100KB"取 q90 起编。
 // 体积在这里直接等于时间：RunPod 代理实测有效吞吐只有约 94KB/s，
-// 每省 10KB 就省 ~100ms。真机上 q92 曾到过 177KB（≈1.9 秒纯上传）。
-const CAP_LONG    = 960, CAP_Q     = 0.75;
-const CAP_MAX_KB  = 90;           // 高清帧体积上限，超了自动降质量重编
+// 100KB 就是 ~1.1 秒纯上传 —— 嫌慢就把这两个值一起调小（q75/90KB 是之前的档）。
+const CAP_LONG    = 960, CAP_Q     = 0.90;
+const CAP_MAX_KB  = 110;          // 体积上限，超了自动降质量重编（留点余量，落点≈100KB）
 
 // 连续几帧合格后自动上传高清帧。
-// 证件 3 帧：避免抓到正在移动的那一瞬。10fps 下这 3 帧只花 300ms，
+// 证件 3 帧：避免抓到正在移动的那一瞬。24fps 下这 3 帧只花 125ms，
 // 不再是延迟瓶颈，所以没必要为了快而降到 2 帧。
 // （另外高清帧到服务端还会被【无状态严格重判】，抓歪了照样拒且不闭锁。）
 // 人脸 1 帧：大小/角度/清晰度这些判定项本身已经挡掉不合格的了。
@@ -129,11 +136,11 @@ function captureAfter(){ return CAPTURE_AFTER_BY_MODE[mode] || 1; }
 // 从【第 1 个合格帧】起就逐帧算清晰度、记住最清晰的那一张；数到第
 // captureAfter() 个合格帧时，把已经挑好的那张直接传上去。
 //
-// 为什么要挑：姿态合格 ≠ 这一帧清晰。手持时手机一直在微动，10fps 下相邻帧的
-// 清晰度能差出好几倍（对焦呼吸、快门期间的位移）。服务端只对上传的那一张做
-// 判定，抓到糊的那张就直接影响 OCR，而且它自己看不出"下一帧其实更清楚"。
+// 为什么要挑：姿态合格 ≠ 这一帧清晰。手持时手机一直在微动，相邻帧的清晰度能
+// 差出好几倍（对焦呼吸、快门期间的位移）。服务端只对上传的那一张做判定，
+// 抓到糊的那张就直接影响 OCR，而且它自己看不出"下一帧其实更清楚"。
 //
-// 选帧窗口 = 第 1 个到第 3 个合格帧之间，10fps 下天然就有 3 帧上下的候选，
+// 选帧窗口 = 第 1 个到第 3 个合格帧之间，候选帧数 ≈ 窗口时长 × FPS，
 // 【一帧都不多等】—— 攒够合格帧的那一刻就发，和不选帧时一样快。
 
 // 清晰度用 Tenengrad（Sobel 梯度平方均值）：越清晰边缘越陡，梯度越大。
@@ -147,7 +154,8 @@ const SHARP_PATCH = 480;
 //
 // 阈值 = 最多容忍多少排队延迟。积压 B 字节、上行 U 字节/秒，新帧就要多等 B/U 秒。
 // 手机上行常只有 ~300KB/s，所以按"最多 ~100ms 排队"取值：
-// 流式帧只有 7KB，24KB ≈ 3.4 帧 ≈ 80ms，10fps 下仍然合适。
+// 24KB / 300KB/s ≈ 80ms 排队。这个判据只跟积压字节和上行带宽有关、
+// 跟发送帧率无关，所以从 10fps 提到 24fps 不用改（只是会更频繁地触发丢帧）。
 // （注意别按 100KB 的老尺寸去算，那样 3 帧就是 1 秒排队，比一帧一答还慢。）
 const MAX_BUFFERED= 24 * 1024;
 
@@ -523,9 +531,8 @@ function onMsg(m){
            m.ok ? 'ok' : (m.reason === 'unstable' ? 'wait' : 'bad'));
   }
 
-  if (m.ok && m.image){
-    $('shot').src = m.image; $('shot').style.display = 'block'; $('empty').style.display = 'none';
-  }
+  // 这里【不】显示 m.image（服务端矫正后的裁图）—— 图片位现在给上传的原始高清帧，
+  // 在 sendCapture() 里就已经填好了。
   draw(m);
 
   // 一次性抓拍：服务端标了 final 就立刻停止发送。
@@ -683,15 +690,28 @@ async function sendCapture(){
     if (!blob || blob.size / 1024 <= CAP_MAX_KB) break;
   }
   if (!blob){ capturing = false; return; }
+  showUploaded(blob);
   ws.send(JSON.stringify({type:'capture'}));
   capSentAt = performance.now();
   ws.send(await blob.arrayBuffer());
 }
 
+/* 把这次真正上传的那一帧显示出来（不是服务端回传的裁图）——
+   要判断"选帧选对没有、清不清晰"，看的就得是上传的原图。 */
+let shotUrl = null;
+function showUploaded(blob){
+  if (shotUrl) URL.revokeObjectURL(shotUrl);   // 不回收的话每拍一次泄漏一张图
+  shotUrl = URL.createObjectURL(blob);
+  $('shot').src = shotUrl;
+  $('shot').style.display = 'block';
+  $('empty').style.display = 'none';
+  $('shotSize').textContent = '（' + (blob.size/1024).toFixed(0) + ' KB）';
+}
+
 async function tick(){
   if (!ws || ws.readyState !== 1) return;
 
-  // 选帧和推流用同一帧、同一个 10fps 节拍。放在背压判断【之前】：打分是纯本地
+  // 选帧和推流用同一帧、同一个 FPS 节拍。放在背压判断【之前】：打分是纯本地
   // 计算，不占上行，上行堵住时更不该跟着停 —— 否则网络一差就攒不到候选，
   // 到该拍的那一刻只能退回"抓当前帧"。
   // 必须同步跑完（pickStep 内部不 await），否则视频已经翻到下一帧，
@@ -760,6 +780,7 @@ $('btnAgain').onclick = () => {
   $('btnAgain').style.display = 'none';
   $('btnStart').style.display = '';
   $('shot').style.display = 'none'; $('empty').style.display = 'block';
+  $('shotSize').textContent = '';
   last = null; okStreak = 0; capturing = false; resetPick();
   ctx.clearRect(0,0,viewW,viewH);
   start();
@@ -798,6 +819,7 @@ function setMode(m){
   $('tabFace').classList.toggle('act', m==='face');
   $('sMode').textContent = m;
   $('shot').style.display='none'; $('empty').style.display='block';
+  $('shotSize').textContent = '';
   $('btnAgain').style.display='none'; $('btnStart').style.display='';   // 换模式=重开一次抓拍
   last = null; okStreak = 0; capturing = false; resetPick();
   ctx.clearRect(0,0,viewW,viewH);
