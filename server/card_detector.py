@@ -51,6 +51,16 @@ class PoseRule:
     min_aspect: float = 1.30                            # 矫正后宽高比区间（身份证≈1.585）
     max_aspect: float = 1.90
 
+    # 清晰度下限（Tenengrad，见 tenengrad()）。0 = 关闭这道闸门。
+    #
+    # 默认关闭是刻意的：绝对阈值必须用真机数据标，拍脑袋定容易误拒 ——
+    # 纹理少、光线暗的证件即使完全对焦，分数也偏低。标定步骤：
+    #   1) 页面上点「录 50 帧供排查」，故意混一些手抖的帧
+    #   2) python tools/analyze_dump.py 看 sharp 字段在清晰帧/糊帧上的分布
+    #   3) 取两簇中间偏低的位置设 CARD_MIN_SHARP，宁松勿紧
+    # 只对【高清抓拍帧】生效（流式帧是 416 缩图，缩放本身就是低通，算了没意义）。
+    min_sharpness: float = _envf("CARD_MIN_SHARP", 0.0)
+
 
 CARD_W, CARD_H = 856, 540             # 输出证件图尺寸（ID-1 标准 85.6x54mm）
 CARD_PAD = _envf("CARD_PAD", 0.03)    # 裁剪时四周多留一圈，只比证件本身大一点
@@ -66,7 +76,25 @@ REASON_TEXT = {
     "out_of_frame": "Card is out of frame. Align it with the frame",
     "bad_aspect": "Card not recognized. Please align it again",
     "unstable": "Hold still...",
+    "blurry": "Image is blurry. Hold the phone steady and try again",
 }
+
+
+def tenengrad(img: np.ndarray) -> float:
+    """清晰度：Sobel 梯度平方的均值。越清晰边缘越陡，梯度越大。
+
+    和前端 web/index.html 的 sharpness() 是同一个公式，但【绝对值不能互比】：
+    前端在原始像素的 480×480 小块上算，这里在矫正后的 856×540 裁图上算，
+    尺度和重采样都不同。两边各自标阈值。
+
+    对糊的判据用它而不是拉普拉斯方差（人脸那道闸门用的是后者）：Tenengrad
+    对噪点没那么敏感。人脸那边裁图尺寸不固定、要先缩到 128×128 再算，
+    证件裁图是固定的 856×540，不需要缩放这一步，逐帧可直接比。
+    """
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    gx = cv2.Sobel(g, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_64F, 0, 1, ksize=3)
+    return float((gx * gx + gy * gy).mean())
 
 
 # ---------------------------------------------------------------- 几何工具
@@ -126,6 +154,7 @@ class CardResult:
     card_jpeg: bytes | None = None
     stable: int = 0
     raw_quad: list[list[float]] = field(default_factory=list)  # 未平滑的原始角点（调试用）
+    sharp: float = 0.0        # 矫正裁图的 Tenengrad，只有高清抓拍帧才算
     held: bool = False        # 本帧漏检，用的是上一帧平滑结果
     jitter: float = 0.0       # 本帧原始角点相对平滑值的平均偏移(px)，反映抖动大小
     votes: str = ""           # 投票窗口状态，如 "3/4"
