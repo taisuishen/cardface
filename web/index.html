@@ -198,6 +198,24 @@ const MOTION_MAX   = 1.5;    // ≈ 帧间位移像素数（噪声底噪约 0.3�
 const SHARP_REL    = 0.70;
 const PICK_TIMEOUT = 2500;   // ms
 
+/* 候选帧的保鲜期。上传的是【存在 bestC 里的旧帧】，不是发送那一刻的画面，
+   所以必须限制它能有多旧 —— 否则会出现这种事：
+
+     用户以为没拍上，把证件移开了 -> 几秒后突然显示"✓ 证件已采集"
+
+   原因是那张旧帧里证件端端正正，服务端照样判合格并 final 闭锁。等待越久越明显：
+   选帧最长等 PICK_TIMEOUT=2.5s，再加 100KB 高清帧的上传时间（RunPod 代理实测
+   约 94KB/s，≈1.1s），最坏情况上传的是 3.6 秒前的画面。
+
+   所以只在最近 BEST_MAX_AGE 内的帧里挑：过期就把 bestScore 清掉，让当前帧重新
+   当最佳。等于一个滑动窗口的"最清晰帧"，代价是丢掉窗口外那些更早的候选 ——
+   但那些帧本来就不该上传。600ms 在 30fps 摄像头下还有约 18 张候选，够挑。 */
+const BEST_MAX_AGE = 600;    // ms
+
+// 高清帧发出后等回执的上限：100KB 上传约 1.1s + 服务端约 40ms + 往返，给足余量。
+// 超时就放弃这次、恢复推流重试 —— 见 armCapWatchdog()。
+const CAP_ACK_TIMEOUT = 5000;   // ms
+
 // 背压：只看"还没发出去的字节数"，不看有没有收到结果。
 //
 // 阈值 = 最多容忍多少排队延迟。积压 B 字节、上行 U 字节/秒，新帧就要多等 B/U 秒。
@@ -226,6 +244,7 @@ let picking = false;     // 正在攒候选：第 1 个合格帧起，逐帧算�
 let picked = 0;          // 已评估的候选帧数
 let bestScore = -1;      // 目前最高的 Tenengrad 分数（-1 = 还没有候选）
 let bestMotion = 0;      // 最佳候选那一帧自己的帧间运动量
+let bestAt = 0;          // 最佳候选是什么时候存下来的，见 BEST_MAX_AGE
 let curMotion = 0;       // 最近一帧的运动量（只用于状态栏显示/标阈值）
 let maxSharp = 0;        // 本次会话见过的最高分，SHARP_REL 的基准
 let pickStart = 0;       // 本轮选帧起始时刻，用于 PICK_TIMEOUT
@@ -526,6 +545,9 @@ function onMsg(m){
   if (m.type === 'record_started'){ banner('正在录制 ' + m.n + ' 帧…', 'wait'); return; }
   if (m.type === 'error'){
     got++;
+    // error 帧不带 capture 标记，分不清是流式帧还是高清帧出的错。宁可一律把
+    // capturing 放掉恢复推流 —— 卡死代价远大于早恢复一点。
+    if (capturing){ clearCapWatchdog(); capturing = false; resetPick(); }
     banner('服务端错误：' + m.msg, 'bad');
     return;
   }
@@ -567,6 +589,7 @@ function onMsg(m){
 
   if (m.capture){
     // 高清帧的回执
+    clearCapWatchdog();
     capturing = false;
     resetPick();
     if (!m.ok){
@@ -777,13 +800,15 @@ function scoreFrame(){
   return { sharp, motion };
 }
 
-/* 把当前帧按高清尺寸存进 bestC，作为目前的最佳候选 */
+/* 把当前帧按高清尺寸存进 bestC，作为目前的最佳候选。
+   记下时刻 —— 上传的是这张【存下来的旧帧】，多旧必须能查，见 BEST_MAX_AGE。 */
 function snapBest(){
   const vw = v.videoWidth, vh = v.videoHeight;
   const s = CAP_LONG / Math.max(vw, vh);
   bestC.width  = Math.round(vw * s);
   bestC.height = Math.round(vh * s);
   bctx.drawImage(v, 0, 0, bestC.width, bestC.height);
+  bestAt = performance.now();
 }
 
 /* 评估一帧，比目前最好的还清晰就替换掉。
@@ -791,6 +816,10 @@ function snapBest(){
    存下来的就不是打分的那一帧了。
    什么时候停由 onMsg 决定（攒够合格帧且够清晰才发），这里不管。 */
 function pickStep(){
+  const now = performance.now();
+  // 候选过期就作废，让当前帧重新当最佳 —— 只在最近 BEST_MAX_AGE 内的帧里挑。
+  if (bestScore >= 0 && now - bestAt > BEST_MAX_AGE) bestScore = -1;
+
   const { sharp, motion } = scoreFrame();
   picked++;
   curMotion = motion;
@@ -853,8 +882,18 @@ async function sendCapture(){
   if (!ws || ws.readyState !== 1 || capturing) return;
   // 一个候选都没攒到就直接用当前帧（人脸模式 captureAfter=1 本来就没有窗口；
   // 证件模式则是几个合格回执挤在同一个 tick 间隔里到达，来不及打分）。
-  if (bestScore < 0) snapBest();
+  if (bestScore < 0){
+    snapBest();
+  } else if (performance.now() - bestAt > BEST_MAX_AGE){
+    // 兜底断言：pickStep 的过期逻辑本该保证不会走到这儿。宁可这次不发、
+    // 重新攒一轮，也不要把明显过期的帧传上去换一个假的"已采集"。
+    resetPick();
+    return;
+  }
   capturing = true;
+  // 上传期间推流是停的，界面会一动不动 —— 必须说一句，否则用户以为没拍上、
+  // 把证件移开，然后被一两秒后冒出来的"已采集"搞糊涂。
+  banner('正在上传高清帧，请保持不动…', 'wait');
   // 体积上限：证件细纹/防伪底纹很多，同样质量下比普通照片大不少
   // （真机实测 q92 到过 177KB；细节极端的图 q82 还能到 240KB，
   //  所以只降一档不够，要循环降到上限以下）。
@@ -866,10 +905,40 @@ async function sendCapture(){
     if (!blob || blob.size / 1024 <= CAP_MAX_KB) break;
   }
   if (!blob){ capturing = false; return; }
-  showUploaded(blob);
-  ws.send(JSON.stringify({type:'capture'}));
-  capSentAt = performance.now();
-  ws.send(await blob.arrayBuffer());
+
+  // 发送必须包起来。capturing=true 之后一旦抛异常就再没人把它清掉，而 tick()
+  // 开头就 `if (capturing) return`，推流会永久停死：图显示着、横幅停在"正在上传"、
+  // 再也收不到任何回执，只能刷新页面。
+  try {
+    const buf = await blob.arrayBuffer();
+    ws.send(JSON.stringify({type:'capture'}));
+    capSentAt = performance.now();
+    ws.send(buf);
+  } catch(e){
+    console.warn('[capture] 上传失败:', e);
+    capturing = false; resetPick();
+    banner('上传失败，继续对准重试…', 'bad');
+    return;
+  }
+  showUploaded(blob);          // 确实发出去了才展示，否则会误以为已上传
+  armCapWatchdog();
+}
+
+/* 高清帧回执看门狗。
+   服务端对【已闭锁】的连接是静默丢弃、不回消息的（见 Conn.submit 里的 done 分支），
+   所以"发出去了但永远等不到回执"是真实存在的一条路径。没有这个超时就只能刷页面。 */
+let capTimer = null;
+function armCapWatchdog(){
+  clearCapWatchdog();
+  capTimer = setTimeout(() => {
+    capTimer = null;
+    if (!capturing) return;
+    capturing = false; resetPick();
+    banner('高清帧没有回执，继续对准重试…', 'bad');
+  }, CAP_ACK_TIMEOUT);
+}
+function clearCapWatchdog(){
+  if (capTimer){ clearTimeout(capTimer); capTimer = null; }
 }
 
 /* 把这次真正上传的那一帧显示出来（不是服务端回传的裁图）——
@@ -949,6 +1018,7 @@ async function start(){
 function stop(){
   clearInterval(timer); timer = null; curFps = 0;
   resetPick();                      // 打分循环也一起停
+  clearCapWatchdog();               // 停了就没人等回执了，免得超时横幅盖掉正常提示
 }
 
 /* 切换推流帧率。定时器周期不能改，只能重建 —— 所以先比一下，
