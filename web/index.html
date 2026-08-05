@@ -101,16 +101,28 @@
 <script>
 /* 两个节拍是分开的，别混：
 
-   FPS       = 【推流】给服务端的帧率。服务端只回答一件事："拍正了没有"
-               （姿态判定 + 实时提示），这个不需要密集采样 —— 手不会在 300ms 内
-               把证件从歪转成正。3fps 下上行只有 7KB × 3 = 21KB/s，GPU 也几乎不占，
-               省下来的带宽全留给最后那张 ~100KB 的高清帧。
+   推流帧率   = 问服务端"拍正了没有"（姿态判定 + 实时提示）。
    SCORE_FPS = 【本地】算 Tenengrad 挑清晰帧的频率。清晰度和姿态相反，是逐帧剧烈
                抖动的（手抖、对焦呼吸），必须密集采样才逮得到清楚的那一帧。
                纯手机端计算，一个字节都不上传，所以完全不受上行和 GPU 限制。
 
-   分工就是：低频问服务端"正不正"，高频在本地挑"清不清楚"。 */
-const FPS         = 3;            // 每秒【推流】帧数
+   分工就是：低频问服务端"正不正"，高频在本地挑"清不清楚"。
+
+   ---- 推流帧率为什么要自适应 ----
+
+   触发抓拍要等【摆正之后的 5 个推流帧】，这 5 帧是两道闸门重叠出来的：
+     服务端投票 VOTE_WIN=4 / VOTE_NEED=3 —— 窗口里原本都是 False，
+       要连过 3 帧才第一次对外报 ok=true（见 CardTracker.step）
+     客户端 captureAfter=3 —— 还要再收到 3 个连续的 ok=true
+   所以延迟 = 5 × 帧间隔。固定 3fps 是 1.67 秒，固定 12fps 是 420ms。
+
+   但这 5 帧只在【证件已经在画面里】时才有意义：用户找角度的那几秒，画面里
+   根本没有证件，推得再快也只是反复收到 no_card。所以按"检没检到"分两档：
+     没检到 -> FPS_IDLE，省电省流量（21KB/s）
+     检到了 -> FPS_ACTIVE，把那 5 帧尽快走完（84KB/s，只持续一两秒）
+   平均带宽仍然接近 idle 档，延迟却拿到了 active 档的水平。 */
+const FPS_IDLE    = 3;            // 画面里没有目标时的推流帧率
+const FPS_ACTIVE  = 12;           // 检到目标后的推流帧率
 
 // 两级分辨率：
 //   流式帧只用来做姿态判定和实时提示 —— 实测把长边从 960 降到 416、质量降到 60，
@@ -181,6 +193,7 @@ const shC = document.createElement('canvas');
 const shctx = shC.getContext('2d', { willReadFrequently: true });
 
 let ws = null, stream = null, timer = null, pingTimer = null;
+let curFps = 0;          // 当前推流帧率（0 = 定时器没在跑），见 setFps()
 let mode = 'card', facing = 'environment', deviceId = '';   // deviceId 为空 = 按 facing 自动选
 let sent = 0, got = 0, dropped = 0, lastSentAt = 0, capSentAt = 0, lastCloseCode = 0;
 let okStreak = 0;        // 连续合格帧数，达到 CAPTURE_AFTER 就进入选帧
@@ -492,6 +505,15 @@ function onMsg(m){
   last = m;
   dropped += (m.dropped || 0);
 
+  // 自适应帧率：画面里有目标就升到 ACTIVE 档，把那 5 帧尽快走完；没有就退回 IDLE。
+  // 判据用 reason 而不是 m.ok —— 证件歪着/太远也算"有目标"，恰恰是最需要
+  // 高频实时提示的阶段（用户正在照着提示调整）。
+  // 抓拍在途时不动帧率：tick 本来就整个跳过，改了也没用，回执到了再说。
+  if (!capturing){
+    const found = m.reason !== 'no_card' && m.reason !== 'no_face';
+    setFps(found ? FPS_ACTIVE : FPS_IDLE);
+  }
+
   $('sMs').textContent    = m.ms + ' ms';
   // 高清帧和流式帧要分别计时。之前统一用 lastSentAt，而 lastSentAt 只在
   // 流式发送时更新、且高清上传期间推流是暂停的，导致高清帧的"往返"把
@@ -782,9 +804,12 @@ let t0 = 0;
 function fpsText(){
   const dt = (performance.now() - t0)/1000;
   // 发送速率和回传速率分开看：一帧一答时两者被 RTT 锁在一起，
-  // 连续发送后发送速率应该稳定贴住 FPS，不再受 RTT 影响。
+  // 连续发送后发送速率应该稳定贴住当前档位，不再受 RTT 影响。
+  // 注意这两个数是【整段会话的均值】，自适应帧率下会是两档的混合，
+  // 所以末尾把当前档位也显示出来，方便看清有没有正常升降档。
   return (sent/Math.max(dt,.001)).toFixed(1) + ' / 回 '
        + (got/Math.max(dt,.001)).toFixed(1) + ' fps / 丢 ' + dropped
+       + '  档' + curFps
        + (ws && ws.bufferedAmount > 0 ? '  缓冲' + (ws.bufferedAmount/1024).toFixed(0) + 'KB' : '');
 }
 
@@ -799,10 +824,22 @@ async function start(){
   }
   sent = 0; got = 0; dropped = 0; okStreak = 0; capturing = false; resetPick();
   t0 = performance.now();
-  clearInterval(timer);
-  timer = setInterval(tick, 1000/FPS);
+  curFps = 0;                       // 强制下面这次 setFps 真正建定时器
+  setFps(FPS_IDLE);                 // 还没看到目标，先按低档起
 }
-function stop(){ clearInterval(timer); timer = null; resetPick(); }   // 打分循环也一起停
+function stop(){
+  clearInterval(timer); timer = null; curFps = 0;
+  resetPick();                      // 打分循环也一起停
+}
+
+/* 切换推流帧率。定时器周期不能改，只能重建 —— 所以先比一下，
+   帧率没变就什么都不做（每收到一条结果都会调用这里）。 */
+function setFps(f){
+  if (f === curFps) return;
+  curFps = f;
+  clearInterval(timer);
+  timer = setInterval(tick, 1000 / f);
+}
 
 $('btnStart').onclick = start;
 $('btnStop').onclick  = () => { stop(); banner('已停止', 'wait'); };
