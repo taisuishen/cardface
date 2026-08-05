@@ -94,6 +94,7 @@
       <tr><td>当前摄像头</td><td id="sCam">-</td></tr>
       <tr><td>角点抖动 / 投票</td><td id="sJit">-</td></tr>
       <tr><td>连续合格 / 触发</td><td id="sStreak">-</td></tr>
+      <tr><td>本地锐度 / 运动量</td><td id="sLocal">-</td></tr>
     </table>
   </div>
 </div>
@@ -174,6 +175,29 @@ const SCORE_FPS   = 60;
 // 各候选帧的块大小一致，分数可以直接比。
 const SHARP_PATCH = 480;
 
+/* ---- 一直摇晃 / 一直没对上焦时，不许交付糊图 ----
+
+   姿态判定测不出运动模糊：手一直抖但证件摆得端正，rot/skew/aspect 全过，
+   3 帧连续合格照样凑得出来。而 Tenengrad 只做【相对】比较（挑窗口里最好的），
+   一窗全糊时它就老实挑出"最不糊的糊图"发出去。所以要两道绝对性的闸门：
+
+   MOTION_MAX：帧间运动量上限，专治手抖。读数≈【相邻两帧之间移动了几个像素】，
+     推导和实测见 scoreFrame()。合成图上静止是 0.29（噪声底噪）、1px 0.83、
+     3px 1.82、6px 3.05，所以 1.5 大致对应"两帧间动了 2px 出头"。
+     这个量与场景对比度无关，可以用固定阈值，但仍建议真机标一次。
+   SHARP_REL：专治【没对上焦】—— 那种情况运动量很低，MOTION_MAX 拦不住，
+     但清晰度会明显低于这台设备在这个场景下能达到的水平。所以拿"本次会话
+     见过的最高分"当基准，要求候选至少达到它的这个比例。
+     局限：如果一开始就一直糊，基准本身就低，这道闸门会失效 —— 兜底靠
+     MOTION_MAX 和服务端的 CARD_MIN_SHARP。
+
+   PICK_TIMEOUT：等不到合格帧的上限。超时就把手上最好的那张【降级发出去】，
+     交给服务端的 blurry 闸门仲裁：它拒了不会闭锁，客户端自然继续重试。
+     宁可这样，也不要在这儿死等到用户以为程序卡了。 */
+const MOTION_MAX   = 1.5;    // ≈ 帧间位移像素数（噪声底噪约 0.3）
+const SHARP_REL    = 0.70;
+const PICK_TIMEOUT = 2500;   // ms
+
 // 背压：只看"还没发出去的字节数"，不看有没有收到结果。
 //
 // 阈值 = 最多容忍多少排队延迟。积压 B 字节、上行 U 字节/秒，新帧就要多等 B/U 秒。
@@ -201,6 +225,12 @@ let capturing = false;   // 高清帧在途，期间暂停推流
 let picking = false;     // 正在攒候选：第 1 个合格帧起，逐帧算清晰度留最好的
 let picked = 0;          // 已评估的候选帧数
 let bestScore = -1;      // 目前最高的 Tenengrad 分数（-1 = 还没有候选）
+let bestMotion = 0;      // 最佳候选那一帧自己的帧间运动量
+let curMotion = 0;       // 最近一帧的运动量（只用于状态栏显示/标阈值）
+let maxSharp = 0;        // 本次会话见过的最高分，SHARP_REL 的基准
+let pickStart = 0;       // 本轮选帧起始时刻，用于 PICK_TIMEOUT
+let pickRoi = null;      // 冻结的打分区域 {x,y,n}，见 startPick()
+let prevGray = null;     // 上一帧的灰度块，用来算帧间运动量
 let zoomApplied = null;  // 实际生效的 zoom 倍数（不支持 zoom 约束则为 null）
 let last = null;   // 最近一次结果，用于画框
 let viewW = 0, viewH = 0;   // 取景区的 CSS 像素尺寸（画框坐标就用这个坐标系）
@@ -550,9 +580,18 @@ function onMsg(m){
       resetPick();                         // 证件动了/脱框了：候选作废，重新数
     } else {
       if (!picking && !capturing) startPick();
+      // 攒够合格帧【且】手上这张够干净才发；不够就把窗口顺延，继续攒。
+      // 用户手稳时这两个闸门一次就过，行为和不设闸门时完全一样、不多等一帧。
       if (okStreak >= captureAfter() && !capturing){
-        picking = false; stopScoring();
-        sendCapture();
+        const why = pickBlocker();
+        const late = performance.now() - pickStart > PICK_TIMEOUT;
+        if (!why || late){
+          if (why) console.log('[pick] 超时降级上传，被拦原因:', why,
+                               'motion=' + bestMotion.toFixed(2),
+                               'sharp=' + bestScore.toFixed(0) + '/' + maxSharp.toFixed(0));
+          picking = false; stopScoring();
+          sendCapture();
+        }
       }
     }
   }
@@ -560,9 +599,24 @@ function onMsg(m){
       + (picking ? '  候选 ' + picked : '')
       + (capturing ? '  高清帧上传中' : '');
 
+  // 标 MOTION_MAX / SHARP_REL 就看这一行：手稳时"动"应该在 0.3~0.8（接近噪声底噪），
+  // 故意晃一晃看它涨到多少，阈值取两者中间。锐度那两个数是"最佳候选 / 会话最高"。
+  $('sLocal').textContent = bestScore < 0 ? '-'
+      : bestScore.toFixed(0) + ' / ' + maxSharp.toFixed(0)
+        + '   动 ' + curMotion.toFixed(2) + '（选中帧 ' + bestMotion.toFixed(2) + '）';
+
   if (!capturing && !m.capture){
-    banner(m.msg + (okStreak ? '  ' + okStreak + '/' + captureAfter() : ''),
-           m.ok ? 'ok' : (m.reason === 'unstable' ? 'wait' : 'bad'));
+    // 被闸门拦下时要说清楚是"抖"还是"没对上焦"，否则用户看到一直提示
+    // "证件已对准"却不出结果，只会以为程序卡了。
+    const why = (picking && okStreak >= captureAfter()) ? pickBlocker() : null;
+    if (why === 'shake'){
+      banner('手机抖动太大，请双手持稳或把手机靠在桌面上', 'bad');
+    } else if (why === 'blur'){
+      banner('画面还不够清晰，等一下对焦…', 'wait');
+    } else {
+      banner(m.msg + (okStreak ? '  ' + okStreak + '/' + captureAfter() : ''),
+             m.ok ? 'ok' : (m.reason === 'unstable' ? 'wait' : 'bad'));
+    }
   }
 
   // 这里【不】显示 m.image（服务端矫正后的裁图）—— 图片位现在给上传的原始高清帧，
@@ -636,13 +690,13 @@ function grab(){ return grabAt(STREAM_LONG, STREAM_Q); }
    （服务端人脸那道 blurry 闸门用的是拉普拉斯，那边是绝对阈值、需要另一种标定；
    这里只在同一场景的几帧之间【比大小】，不需要绝对阈值，也就不必两边一致）。 */
 
-/* 给当前帧打分：取目标中心的一块原尺寸像素，算 Tenengrad */
-function sharpness(){
+/* 算打分区域：目标中心的一块原尺寸像素。
+   证件用四角中心，人脸用检测框中心；都是上传帧（416 长边）坐标系，
+   按比例映射回视频原始像素。没有结果就退化成画面中心。 */
+function computeRoi(){
   const vw = v.videoWidth, vh = v.videoHeight;
-  if (!vw) return 0;
+  if (!vw) return null;
 
-  // 定位：证件用四角中心，人脸用检测框中心。都是上传帧（416 长边）的坐标系，
-  // 按比例映射回视频原始像素。没有结果就退化成画面中心。
   let cx = vw / 2, cy = vh / 2;
   const fs = last && last.frame_size;
   if (fs && fs[0]){
@@ -657,19 +711,39 @@ function sharpness(){
     }
   }
   const n = Math.min(SHARP_PATCH, vw, vh);
-  const x = Math.max(0, Math.min(vw - n, Math.round(cx - n / 2)));
-  const y = Math.max(0, Math.min(vh - n, Math.round(cy - n / 2)));
+  return {
+    x: Math.max(0, Math.min(vw - n, Math.round(cx - n / 2))),
+    y: Math.max(0, Math.min(vh - n, Math.round(cy - n / 2))),
+    n,
+  };
+}
+
+/* 给当前帧打分：返回 {sharp, motion}。
+   区域用 startPick() 冻结下来的那个，【整轮选帧不变】—— 否则 last 每来一条
+   结果就把区域挪一下，帧间差里混进"区域自己跳了"的位移，运动量就没法读了。 */
+function scoreFrame(){
+  const roi = pickRoi;
+  if (!roi) return { sharp: 0, motion: 0 };
+  const n = roi.n;
 
   shC.width = n; shC.height = n;
-  shctx.drawImage(v, x, y, n, n, 0, 0, n, n);      // 1:1，不缩放
+  shctx.drawImage(v, roi.x, roi.y, n, n, 0, 0, n, n);   // 1:1，不缩放
   const d = shctx.getImageData(0, 0, n, n).data;
 
-  // 先转灰度：整型权重 (77,150,29)/256 ≈ BT.601，比浮点快
+  // 先转灰度：整型权重 (77,150,29)/256 ≈ BT.601，比浮点快。
+  // 帧间绝对差顺手在这一趟里累加，省一次遍历。
   const g = new Uint8Array(n * n);
+  const canDiff = prevGray && prevGray.length === g.length;
+  let diff = 0;
   for (let i = 0, p = 0; i < g.length; i++, p += 4){
-    g[i] = (d[p] * 77 + d[p+1] * 150 + d[p+2] * 29) >> 8;
+    const y = (d[p] * 77 + d[p+1] * 150 + d[p+2] * 29) >> 8;
+    g[i] = y;
+    if (canDiff) diff += Math.abs(y - prevGray[i]);
   }
-  let sum = 0;
+
+  // Tenengrad（梯度平方均值）和梯度强度（|gx|+|gy| 均值）一趟算完，
+  // 后者是下面估位移的分母。
+  let sum = 0, gradAbs = 0;
   for (let yy = 1; yy < n - 1; yy++){
     const r0 = (yy-1)*n, r1 = yy*n, r2 = (yy+1)*n;
     for (let xx = 1; xx < n - 1; xx++){
@@ -678,9 +752,29 @@ function sharpness(){
       const gy = -g[r0+xx-1] - 2*g[r0+xx] - g[r0+xx+1]
                +  g[r2+xx-1] + 2*g[r2+xx] + g[r2+xx+1];
       sum += gx*gx + gy*gy;
+      gradAbs += Math.abs(gx) + Math.abs(gy);
     }
   }
-  return sum / ((n-2) * (n-2));
+  const inner = (n-2) * (n-2);
+  const sharp = sum / inner;
+
+  // 帧间运动量 ≈ 【两帧之间移动了几个像素】。
+  //
+  // 依据：位移 δ 造成的强度变化 |ΔI| ≈ |∇I|·δ，所以 mean|ΔI| / mean|∇I| ≈ δ。
+  // Sobel 核对线性斜坡有 8 倍增益，乘回来，读数就直接是像素。
+  //
+  // 关键是【除以梯度强度而不是除以标准差】。除标准差看着也像归一化，实测却是错的：
+  // 分子里的传感器噪声不随对比度变小，一除就被放大 —— 低对比度画面轻轻一动
+  // 读数就飙到高对比度剧烈晃动的 3 倍，完全反了。除梯度强度则分子分母同步缩放。
+  //
+  // 合成图实测（480×480，σ=2 噪声）：
+  //   静止 0.29（这就是噪声底噪） | 1px 0.83 | 3px 1.82 | 6px 3.05
+  //   低对比度 3px 1.73 vs 高对比度 3px 1.82  -> 确认与对比度无关
+  //   已散焦 + 1px 0.68 vs 清晰 + 1px 0.83   -> 散焦不会把读数抬高
+  let motion = 0;
+  if (canDiff) motion = 8 * (diff / g.length) / Math.max(gradAbs / inner, 1);
+  prevGray = g;
+  return { sharp, motion };
 }
 
 /* 把当前帧按高清尺寸存进 bestC，作为目前的最佳候选 */
@@ -695,11 +789,25 @@ function snapBest(){
 /* 评估一帧，比目前最好的还清晰就替换掉。
    必须【同步】跑完评分和存帧，中间不能 await —— 否则视频已经翻到下一帧，
    存下来的就不是打分的那一帧了。
-   什么时候停由 onMsg 决定（攒够合格帧就发），这里不管。 */
+   什么时候停由 onMsg 决定（攒够合格帧且够清晰才发），这里不管。 */
 function pickStep(){
-  const s = sharpness();
+  const { sharp, motion } = scoreFrame();
   picked++;
-  if (s > bestScore){ bestScore = s; snapBest(); }
+  curMotion = motion;
+  if (sharp > maxSharp) maxSharp = sharp;
+  // 记下最佳候选【自己那一帧】的运动量：闸门要判的是选出来这张糊不糊，
+  // 不是"现在手稳不稳"。
+  if (sharp > bestScore){ bestScore = sharp; bestMotion = motion; snapBest(); }
+}
+
+/* 现在能不能拍？返回拦下来的原因，null = 可以拍。
+   第一帧（prevGray 还没建立）运动量恒为 0，会被当成"很稳"，但那一帧同时也是
+   唯一的候选，拦它没有意义 —— 真在抖的话紧随其后的帧会把 bestMotion 顶上去。 */
+function pickBlocker(){
+  if (bestScore < 0) return null;                              // 一张候选都没有，别拦
+  if (bestMotion > MOTION_MAX) return 'shake';
+  if (maxSharp > 0 && bestScore < SHARP_REL * maxSharp) return 'blur';
+  return null;
 }
 
 /* 本地打分循环，和推流的 setInterval(tick) 各跑各的。
@@ -725,8 +833,18 @@ function stopScoring(){
   if (scoreTimer){ clearInterval(scoreTimer); scoreTimer = null; }
 }
 
-function startPick(){ picking = true; picked = 0; bestScore = -1; startScoring(); }
-function resetPick(){ picking = false; picked = 0; bestScore = -1; stopScoring(); }
+function startPick(){
+  picking = true; picked = 0; bestScore = -1; bestMotion = 0;
+  pickStart = performance.now();
+  pickRoi = computeRoi();     // 整轮冻结，见 scoreFrame()
+  prevGray = null;            // 换了区域，上一帧的块不能再拿来做差
+  startScoring();
+}
+function resetPick(){
+  picking = false; picked = 0; bestScore = -1; bestMotion = 0;
+  pickRoi = null; prevGray = null;
+  stopScoring();
+}
 
 /* 攒够合格帧后，把窗口里最清晰的那一帧作为高清帧上传，出最终裁图。
    先发 {"type":"capture"} 告诉服务端"下一个二进制帧按高清处理"，
@@ -823,6 +941,7 @@ async function start(){
     }
   }
   sent = 0; got = 0; dropped = 0; okStreak = 0; capturing = false; resetPick();
+  maxSharp = 0; curMotion = 0;      // SHARP_REL 的基准按会话重新学
   t0 = performance.now();
   curFps = 0;                       // 强制下面这次 setFps 真正建定时器
   setFps(FPS_IDLE);                 // 还没看到目标，先按低档起
