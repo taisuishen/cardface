@@ -73,9 +73,9 @@
   </div>
 
   <div class="card">
-    <h3>上传的高清帧 <span id="shotSize"></span></h3>
-    <img id="shot" alt="uploaded">
-    <div id="empty">这里显示选中并上传的那一帧高清图</div>
+    <h3>本地选中的高清帧 <span id="shotSize"></span></h3>
+    <img id="shot" alt="picked frame">
+    <div id="empty">这里显示本地挑出的那一帧高清图（不经过服务端）</div>
   </div>
 
   <div class="card">
@@ -84,7 +84,7 @@
       <tr><td>连接</td><td id="sWs">未连接</td></tr>
       <tr><td>模式</td><td id="sMode">card</td></tr>
       <tr><td>发送/回传帧率 丢帧</td><td id="sFps">-</td></tr>
-      <tr><td>上传大小</td><td id="sSize">-</td></tr>
+      <tr><td>推流帧大小</td><td id="sSize">-</td></tr>
       <tr><td>服务端耗时</td><td id="sMs">-</td></tr>
       <tr><td>往返延迟</td><td id="sRtt">-</td></tr>
       <tr><td>判定</td><td id="sReason">-</td></tr>
@@ -109,64 +109,61 @@
 
    分工就是：低频问服务端"正不正"，高频在本地挑"清不清楚"。
 
-   ---- 推流帧率为什么要自适应 ----
+   ---- 延迟构成，改帧率前先看这里 ----
 
-   触发抓拍要等【摆正之后的 5 个推流帧】，这 5 帧是两道闸门重叠出来的：
+   出图要等【摆正之后的 5 个推流帧】，这 5 帧是两道闸门重叠出来的：
      服务端投票 VOTE_WIN=4 / VOTE_NEED=3 —— 窗口里原本都是 False，
        要连过 3 帧才第一次对外报 ok=true（见 CardTracker.step）
      客户端 captureAfter=3 —— 还要再收到 3 个连续的 ok=true
-   所以延迟 = 5 × 帧间隔。固定 3fps 是 1.67 秒，固定 12fps 是 420ms。
+   所以延迟 = 5 × 帧间隔 = 3fps 下约 1.67 秒。
 
-   但这 5 帧只在【证件已经在画面里】时才有意义：用户找角度的那几秒，画面里
-   根本没有证件，推得再快也只是反复收到 no_card。所以按"检没检到"分两档：
-     没检到 -> FPS_IDLE，省电省流量（21KB/s）
-     检到了 -> FPS_ACTIVE，把那 5 帧尽快走完（84KB/s，只持续一两秒）
-   平均带宽仍然接近 idle 档，延迟却拿到了 active 档的水平。 */
-const FPS_IDLE    = 3;            // 画面里没有目标时的推流帧率
-const FPS_ACTIVE  = 12;           // 检到目标后的推流帧率
+   注意这只是【看起来慢】的那一半。以前还要再加高清帧上传（100KB ÷ 约 94KB/s
+   ≈ 1.1 秒），现在最终出图完全本地、不过网络，那 1.1 秒没了。
+   真嫌慢的话，优先动 captureAfter 和服务端 VOTE_NEED（各值 333ms），
+   而不是加帧率 —— 加帧率是拿带宽换延迟，改门槛是白捡的。 */
+const FPS         = 3;            // 每秒【推流】帧数，只用于问服务端"摆正了没有"
 
-// 两级分辨率：
-//   流式帧只用来做姿态判定和实时提示 —— 实测把长边从 960 降到 416、质量降到 60，
-//   单帧从 51KB 掉到 7KB（省 86%），而检出率仍是 10/10、角点误差 17.8px vs 18.2px，
-//   基本没损失（模型反正会 letterbox 到 960，证件四角是粗特征）。
-//   高清帧只在"连续 N 帧合格"后传一次，用来出最终裁图 —— 回传的证件图是从
-//   上传帧透视矫正来的，这一张必须够清晰，否则 OCR 会受影响。
-const STREAM_LONG = 416, STREAM_Q  = 0.60;   // 约 7KB
-// 高清帧质量：真实照片实测 q92=106KB / q82=70KB / q75=58KB，
-// PSNR 依次 44.3 / 41.6 / 40.2 dB。按"约 100KB"取 q90 起编。
-// 体积在这里直接等于时间：RunPod 代理实测有效吞吐只有约 94KB/s，
-// 100KB 就是 ~1.1 秒纯上传 —— 嫌慢就把这两个值一起调小（q75/90KB 是之前的档）。
+// 两级分辨率，用途完全不同：
+//   流式帧【要上传】，只用来做姿态判定和实时提示 —— 实测把长边从 960 降到 416、
+//   质量降到 60，单帧从 51KB 掉到 7KB（省 86%），而检出率仍是 10/10、
+//   角点误差 17.8px vs 18.2px，基本没损失（模型反正会 letterbox 到 960，
+//   证件四角是粗特征）。
+const STREAM_LONG = 416, STREAM_Q  = 0.60;   // 约 5~7KB
+//   高清帧【不上传】，是本地挑出来的成果图。真实照片实测
+//   q92=106KB / q82=70KB / q75=58KB，PSNR 依次 44.3 / 41.6 / 40.2 dB，
+//   按"约 100KB"取 q90 起编。它不过网络，压体积只是给下游一个可控尺寸。
 const CAP_LONG    = 960, CAP_Q     = 0.90;
 const CAP_MAX_KB  = 110;          // 体积上限，超了自动降质量重编（留点余量，落点≈100KB）
 
-// 连续几帧合格后自动上传高清帧。
+// 连续几帧合格后出图。
 // 证件 3 帧：避免抓到正在移动的那一瞬。
-// ⚠ 3fps 下这 3 帧要 1 秒，是目前【最大的一块延迟】（10fps 时才 300ms）。
-//   想更快就把这里改成 2（省 333ms），代价是更容易抓到正在移动的那一瞬 ——
-//   不过高清帧到服务端还会被【无状态严格重判】，抓歪了照样拒且不闭锁，
-//   所以降到 2 的风险其实不大，值得真机试一把。
+// ⚠ 3fps 下这 3 帧要 1 秒，是目前【最大的一块延迟】。想更快就改成 2（省 333ms）。
+//   注意现在没有"服务端无状态重判"这道后置保险了（不再上传高清帧），
+//   抓歪了不会有人拦，所以降到 2 之前先真机看看出图质量。
 // 人脸 1 帧：大小/角度/清晰度这些判定项本身已经挡掉不合格的了。
 const CAPTURE_AFTER_BY_MODE = { card: 3, face: 1 };
 function captureAfter(){ return CAPTURE_AFTER_BY_MODE[mode] || 1; }
 
 // 从【第 1 个合格帧】起就逐帧算清晰度、记住最清晰的那一张；数到第
-// captureAfter() 个合格帧时，把已经挑好的那张直接传上去。
+// captureAfter() 个合格帧时，把已经挑好的那张直接出图。
 //
 // 为什么要挑：姿态合格 ≠ 这一帧清晰。手持时手机一直在微动，相邻帧的清晰度能
-// 差出好几倍（对焦呼吸、快门期间的位移）。服务端只对上传的那一张做判定，
-// 抓到糊的那张就直接影响 OCR，而且它自己看不出"下一帧其实更清楚"。
+// 差出好几倍（对焦呼吸、快门期间的位移）。而服务端只看 3fps 里那几帧的姿态，
+// 完全不知道哪一帧清楚 —— 清晰度这件事只有本地判得起。
 //
-// 选帧窗口 = 第 1 个到第 3 个合格帧之间，候选帧数 ≈ 窗口时长 × SCORE_FPS，
-// 【一帧都不多等】—— 攒够合格帧的那一刻就发，和不选帧时一样快。
+// 选帧窗口 = 第 1 个到第 3 个合格帧之间（3fps 下约 667ms），
+// 候选帧数 ≈ 窗口时长 × SCORE_FPS ≈ 16 张，
+// 【一帧都不多等】—— 攒够合格帧的那一刻就出图。
 
-// 打分频率。这是纯本地计算（一个字节都不上传），所以跟推流帧率完全解耦：
-// 推流受上行和 GPU 限制只能 24，本地想看多快看多快，看得越密候选越多。
+// 本地打分频率。纯手机端计算、一个字节都不上传，所以跟推流的 3fps 完全解耦：
+// 推流受上行和 GPU 约束只能低频，本地判高清清晰度想多密就多密。
 //
 // 优先用 requestVideoFrameCallback：摄像头【每出一张新帧】才回调一次，
-// 不重复给同一帧打分。手机摄像头通常只有 30fps，用 60Hz 定时器去轮询的话
-// 有一半在给同一帧重复算 Tenengrad，白烧 CPU 还挤占编码时间。
-// 不支持 rVFC 的浏览器才退回定时器，按 SCORE_FPS 轮询。
-const SCORE_FPS   = 60;
+// 不会给同一帧重复打分。再按 SCORE_FPS 限一道流 ——
+// 实际生效的是 min(摄像头帧率, SCORE_FPS)：30fps 摄像头配 24 的上限，
+// 会稳定落在 22~24；60fps 摄像头则被压到 24，不白烧 CPU。
+// 不支持 rVFC 的浏览器退回定时器轮询，同样是这个频率。
+const SCORE_FPS   = 24;
 
 // 清晰度用 Tenengrad（Sobel 梯度平方均值）：越清晰边缘越陡，梯度越大。
 // 只在【原始像素】的一小块上算，不缩放 —— 缩放本身就是低通滤波，会把
@@ -188,12 +185,14 @@ const SHARP_PATCH = 480;
    SHARP_REL：专治【没对上焦】—— 那种情况运动量很低，MOTION_MAX 拦不住，
      但清晰度会明显低于这台设备在这个场景下能达到的水平。所以拿"本次会话
      见过的最高分"当基准，要求候选至少达到它的这个比例。
-     局限：如果一开始就一直糊，基准本身就低，这道闸门会失效 —— 兜底靠
-     MOTION_MAX 和服务端的 CARD_MIN_SHARP。
+     局限：如果一开始就一直糊，基准本身就低，这道闸门会失效 —— 只能靠 MOTION_MAX。
+     ⚠ 服务端那道 CARD_MIN_SHARP 现在【不参与】：它长在 process_capture 里，
+       而客户端已经不发高清帧了，那条路径永远不会被触发。也就是说清晰度这件事
+       现在【只有这两道前端闸门在管】，没有后置安全网。
 
-   PICK_TIMEOUT：等不到合格帧的上限。超时就把手上最好的那张【降级发出去】，
-     交给服务端的 blurry 闸门仲裁：它拒了不会闭锁，客户端自然继续重试。
-     宁可这样，也不要在这儿死等到用户以为程序卡了。 */
+   PICK_TIMEOUT：等不到合格帧的上限。超时就把手上最好的那张【降级出图】——
+     宁可给一张不够理想的，也不要在这儿死等到用户以为程序卡了。
+     被降级的原因会打到 console，真机排查时看那里。 */
 const MOTION_MAX   = 1.5;    // ≈ 帧间位移像素数（噪声底噪约 0.3）
 const SHARP_REL    = 0.70;
 const PICK_TIMEOUT = 2500;   // ms
@@ -212,9 +211,6 @@ const PICK_TIMEOUT = 2500;   // ms
    但那些帧本来就不该上传。600ms 在 30fps 摄像头下还有约 18 张候选，够挑。 */
 const BEST_MAX_AGE = 600;    // ms
 
-// 高清帧发出后等回执的上限：100KB 上传约 1.1s + 服务端约 40ms + 往返，给足余量。
-// 超时就放弃这次、恢复推流重试 —— 见 armCapWatchdog()。
-const CAP_ACK_TIMEOUT = 5000;   // ms
 
 // 背压：只看"还没发出去的字节数"，不看有没有收到结果。
 //
@@ -235,11 +231,9 @@ const shC = document.createElement('canvas');
 const shctx = shC.getContext('2d', { willReadFrequently: true });
 
 let ws = null, stream = null, timer = null, pingTimer = null;
-let curFps = 0;          // 当前推流帧率（0 = 定时器没在跑），见 setFps()
 let mode = 'card', facing = 'environment', deviceId = '';   // deviceId 为空 = 按 facing 自动选
-let sent = 0, got = 0, dropped = 0, lastSentAt = 0, capSentAt = 0, lastCloseCode = 0;
+let sent = 0, got = 0, dropped = 0, lastSentAt = 0, lastCloseCode = 0;
 let okStreak = 0;        // 连续合格帧数，达到 CAPTURE_AFTER 就进入选帧
-let capturing = false;   // 高清帧在途，期间暂停推流
 let picking = false;     // 正在攒候选：第 1 个合格帧起，逐帧算清晰度留最好的
 let picked = 0;          // 已评估的候选帧数
 let bestScore = -1;      // 目前最高的 Tenengrad 分数（-1 = 还没有候选）
@@ -545,9 +539,7 @@ function onMsg(m){
   if (m.type === 'record_started'){ banner('正在录制 ' + m.n + ' 帧…', 'wait'); return; }
   if (m.type === 'error'){
     got++;
-    // error 帧不带 capture 标记，分不清是流式帧还是高清帧出的错。宁可一律把
-    // capturing 放掉恢复推流 —— 卡死代价远大于早恢复一点。
-    if (capturing){ clearCapWatchdog(); capturing = false; resetPick(); }
+    resetPick();               // 这一帧判定没出来，候选窗口作废重新数
     banner('服务端错误：' + m.msg, 'bad');
     return;
   }
@@ -557,27 +549,12 @@ function onMsg(m){
   last = m;
   dropped += (m.dropped || 0);
 
-  // 自适应帧率：画面里有目标就升到 ACTIVE 档，把那 5 帧尽快走完；没有就退回 IDLE。
-  // 判据用 reason 而不是 m.ok —— 证件歪着/太远也算"有目标"，恰恰是最需要
-  // 高频实时提示的阶段（用户正在照着提示调整）。
-  // 抓拍在途时不动帧率：tick 本来就整个跳过，改了也没用，回执到了再说。
-  if (!capturing){
-    const found = m.reason !== 'no_card' && m.reason !== 'no_face';
-    setFps(found ? FPS_ACTIVE : FPS_IDLE);
-  }
-
   $('sMs').textContent    = m.ms + ' ms';
-  // 高清帧和流式帧要分别计时。之前统一用 lastSentAt，而 lastSentAt 只在
-  // 流式发送时更新、且高清上传期间推流是暂停的，导致高清帧的"往返"把
-  // 等凑够连续帧 + 手机编码 JPEG 的时间也算进去了（真机上显示成 3655ms）。
-  const t_ref = m.capture ? capSentAt : lastSentAt;
-  $('sRtt').textContent = (t_ref ? (performance.now() - t_ref).toFixed(0) : '-')
-      + ' ms' + (m.capture ? ' (高清帧)' : '');
+  $('sRtt').textContent = (lastSentAt ? (performance.now() - lastSentAt).toFixed(0) : '-') + ' ms';
   $('sReason').textContent= m.reason;
   $('sConf').textContent  = (m.conf ?? '-');
   $('sSize').textContent  = (m.bytes_in/1024).toFixed(0) + ' KB @ '
-                          + m.frame_size[0] + '×' + m.frame_size[1]
-                          + (m.capture ? '  (高清)' : '');
+                          + m.frame_size[0] + '×' + m.frame_size[1];
   $('sJit').textContent = m.mode === 'card'
       ? (m.jitter != null ? m.jitter + ' px' : '-') + ' / ' + (m.votes || '-')
         + (m.held ? '  (漏检沿用上帧)' : '')
@@ -587,40 +564,28 @@ function onMsg(m){
       ? (m.rotate_deg ?? '-') + '° / ' + (m.skew ?? '-')
       : 'roll ' + (m.roll_deg ?? '-') + '° / yaw ' + (m.yaw_ratio ?? '-');
 
-  if (m.capture){
-    // 高清帧的回执
-    clearCapWatchdog();
-    capturing = false;
-    resetPick();
-    if (!m.ok){
-      okStreak = 0;                        // 高清帧没通过：清零重来，服务端也没闭锁
-      banner('高清帧未通过（' + m.msg + '），继续对准…', 'bad');
-    }
+  // 数连续合格帧。第 1 个合格帧就开始本地打分攒候选，够数了直接出图。
+  okStreak = m.ok ? okStreak + 1 : 0;
+  if (!m.ok){
+    resetPick();                           // 证件动了/脱框了：候选作废，重新数
   } else {
-    // 流式帧：数连续合格帧。第 1 个合格帧就开始攒候选，够数了立刻发最清晰的那张。
-    okStreak = m.ok ? okStreak + 1 : 0;
-    if (!m.ok){
-      resetPick();                         // 证件动了/脱框了：候选作废，重新数
-    } else {
-      if (!picking && !capturing) startPick();
-      // 攒够合格帧【且】手上这张够干净才发；不够就把窗口顺延，继续攒。
-      // 用户手稳时这两个闸门一次就过，行为和不设闸门时完全一样、不多等一帧。
-      if (okStreak >= captureAfter() && !capturing){
-        const why = pickBlocker();
-        const late = performance.now() - pickStart > PICK_TIMEOUT;
-        if (!why || late){
-          if (why) console.log('[pick] 超时降级上传，被拦原因:', why,
-                               'motion=' + bestMotion.toFixed(2),
-                               'sharp=' + bestScore.toFixed(0) + '/' + maxSharp.toFixed(0));
-          picking = false; stopScoring();
-          sendCapture();
-        }
+    if (!picking) startPick();
+    // 攒够合格帧【且】手上这张够干净才出图；不够就把窗口顺延，继续攒。
+    // 用户手稳时这两个闸门一次就过，行为和不设闸门时完全一样、不多等一帧。
+    if (okStreak >= captureAfter()){
+      const why = pickBlocker();
+      const late = performance.now() - pickStart > PICK_TIMEOUT;
+      if (!why || late){
+        if (why) console.log('[pick] 超时降级出图，被拦原因:', why,
+                             'motion=' + bestMotion.toFixed(2),
+                             'sharp=' + bestScore.toFixed(0) + '/' + maxSharp.toFixed(0));
+        picking = false; stopScoring();
+        finishPick();
       }
     }
   }
   $('sStreak').textContent = okStreak + '/' + captureAfter()
-      + (picking ? '  候选 ' + picked : '')
-      + (capturing ? '  高清帧上传中' : '');
+      + (picking ? '  候选 ' + picked : '');
 
   // 标 MOTION_MAX / SHARP_REL 就看这一行：手稳时"动"应该在 0.3~0.8（接近噪声底噪），
   // 故意晃一晃看它涨到多少，阈值取两者中间。锐度那两个数是"最佳候选 / 会话最高"。
@@ -628,32 +593,28 @@ function onMsg(m){
       : bestScore.toFixed(0) + ' / ' + maxSharp.toFixed(0)
         + '   动 ' + curMotion.toFixed(2) + '（选中帧 ' + bestMotion.toFixed(2) + '）';
 
-  if (!capturing && !m.capture){
-    // 被闸门拦下时要说清楚是"抖"还是"没对上焦"，否则用户看到一直提示
-    // "证件已对准"却不出结果，只会以为程序卡了。
-    const why = (picking && okStreak >= captureAfter()) ? pickBlocker() : null;
-    if (why === 'shake'){
-      banner('手机抖动太大，请双手持稳或把手机靠在桌面上', 'bad');
-    } else if (why === 'blur'){
-      banner('画面还不够清晰，等一下对焦…', 'wait');
-    } else {
-      banner(m.msg + (okStreak ? '  ' + okStreak + '/' + captureAfter() : ''),
-             m.ok ? 'ok' : (m.reason === 'unstable' ? 'wait' : 'bad'));
-    }
+  // 被闸门拦下时要说清楚是"抖"还是"没对上焦"，否则用户看到一直提示
+  // "证件已对准"却不出结果，只会以为程序卡了。
+  const why = (picking && okStreak >= captureAfter()) ? pickBlocker() : null;
+  if (why === 'shake'){
+    banner('手机抖动太大，请双手持稳或把手机靠在桌面上', 'bad');
+  } else if (why === 'blur'){
+    banner('画面还不够清晰，等一下对焦…', 'wait');
+  } else {
+    banner(m.msg + (okStreak ? '  ' + okStreak + '/' + captureAfter() : ''),
+           m.ok ? 'ok' : (m.reason === 'unstable' ? 'wait' : 'bad'));
   }
 
-  // 这里【不】显示 m.image（服务端矫正后的裁图）—— 图片位现在给上传的原始高清帧，
-  // 在 sendCapture() 里就已经填好了。
+  // 服务端只回判定，不再回图：m.image / m.final 这条路径客户端已经不用了
+  // （不发 capture 帧，服务端的 process_capture 和闭锁逻辑就永远不会被触发）。
   draw(m);
-
-  // 一次性抓拍：服务端标了 final 就立刻停止发送。
-  // 服务端那边也同时闭锁了，即使这里没停它也不会再处理、不会再回消息。
-  if (m.final) finish(m);
 }
 
-function finish(m){
+/* 采集完成。现在由【客户端】自己判定结束，不再等服务端的 final ——
+   服务端的作用只剩"这一帧摆正了没有"。 */
+function finish(){
   stop();                                  // 停掉发送定时器（摄像头预览保留）
-  banner(m.mode === 'card' ? '✓ 证件已采集，已停止发送' : '✓ 人脸已采集，已停止发送', 'ok');
+  banner(mode === 'card' ? '✓ 证件已采集（本地出图）' : '✓ 人脸已采集（本地出图）', 'ok');
   $('btnStart').style.display = 'none';
   $('btnAgain').style.display = '';
   $('sFps').textContent = fpsText() + '  已停止';
@@ -844,16 +805,25 @@ function pickBlocker(){
 let scoreVfc = 0, scoreTimer = null;
 function startScoring(){
   stopScoring();
+  const period = 1000 / SCORE_FPS;
   if (typeof v.requestVideoFrameCallback === 'function'){
+    // rVFC 按摄像头帧率回调（常见 30fps，也可能 60），这里再限一道流：
+    // 只有距上次打分够久了才算，其余回调空转。所以实际频率 = min(摄像头, SCORE_FPS)。
+    // nextAt 从"上次应到的时刻"往后推、不追赶漂移，避免掉帧后连续补算。
+    let nextAt = 0;
     const step = () => {
       scoreVfc = 0;
-      if (!picking) return;              // 已经拍完或作废了，自然结束
-      pickStep();
+      if (!picking) return;              // 已经出图或作废了，自然结束
+      const now = performance.now();
+      if (now >= nextAt){
+        pickStep();
+        nextAt = Math.max(now, nextAt) + period;
+      }
       scoreVfc = v.requestVideoFrameCallback(step);
     };
     scoreVfc = v.requestVideoFrameCallback(step);
   } else {
-    scoreTimer = setInterval(() => { if (picking) pickStep(); }, 1000 / SCORE_FPS);
+    scoreTimer = setInterval(() => { if (picking) pickStep(); }, period);
   }
 }
 function stopScoring(){
@@ -875,76 +845,43 @@ function resetPick(){
   stopScoring();
 }
 
-/* 攒够合格帧后，把窗口里最清晰的那一帧作为高清帧上传，出最终裁图。
-   先发 {"type":"capture"} 告诉服务端"下一个二进制帧按高清处理"，
-   服务端对这一帧走无状态严格判定，通不过不会闭锁、可以继续重试。 */
-async function sendCapture(){
-  if (!ws || ws.readyState !== 1 || capturing) return;
+/* 攒够合格帧后出图。【全程本地】：不上传，只把窗口里最清晰的那一帧编码出来展示。
+   服务端的角色只剩"这一帧摆正了没有"，最终这张图不再过网络。 */
+async function finishPick(){
   // 一个候选都没攒到就直接用当前帧（人脸模式 captureAfter=1 本来就没有窗口；
   // 证件模式则是几个合格回执挤在同一个 tick 间隔里到达，来不及打分）。
   if (bestScore < 0){
     snapBest();
   } else if (performance.now() - bestAt > BEST_MAX_AGE){
-    // 兜底断言：pickStep 的过期逻辑本该保证不会走到这儿。宁可这次不发、
-    // 重新攒一轮，也不要把明显过期的帧传上去换一个假的"已采集"。
+    // 兜底断言：pickStep 的过期逻辑本该保证不会走到这儿。宁可这次不出图、
+    // 重新攒一轮，也不要拿一张明显过期的帧交差。
     resetPick();
     return;
   }
-  capturing = true;
-  // 上传期间推流是停的，界面会一动不动 —— 必须说一句，否则用户以为没拍上、
-  // 把证件移开，然后被一两秒后冒出来的"已采集"搞糊涂。
-  banner('正在上传高清帧，请保持不动…', 'wait');
+
   // 体积上限：证件细纹/防伪底纹很多，同样质量下比普通照片大不少
   // （真机实测 q92 到过 177KB；细节极端的图 q82 还能到 240KB，
   //  所以只降一档不够，要循环降到上限以下）。
-  // 手机上多编一次约几十毫秒，比在慢上行上多传几十 KB 便宜得多。
-  // 只降质量不降分辨率：分辨率直接决定最终裁图的清晰度，代价更大。
+  // 现在这张图不过网络，压体积纯粹是为了给下游（保存/后续上传）一个可控的尺寸。
+  // 只降质量不降分辨率：分辨率直接决定证件细节，代价更大。
   let blob = null;
   for (let q = CAP_Q; q >= 0.5; q -= 0.12){
     blob = await new Promise(r => bestC.toBlob(r, 'image/jpeg', q));
     if (!blob || blob.size / 1024 <= CAP_MAX_KB) break;
   }
-  if (!blob){ capturing = false; return; }
+  if (!blob) return;
 
-  // 发送必须包起来。capturing=true 之后一旦抛异常就再没人把它清掉，而 tick()
-  // 开头就 `if (capturing) return`，推流会永久停死：图显示着、横幅停在"正在上传"、
-  // 再也收不到任何回执，只能刷新页面。
-  try {
-    const buf = await blob.arrayBuffer();
-    ws.send(JSON.stringify({type:'capture'}));
-    capSentAt = performance.now();
-    ws.send(buf);
-  } catch(e){
-    console.warn('[capture] 上传失败:', e);
-    capturing = false; resetPick();
-    banner('上传失败，继续对准重试…', 'bad');
-    return;
-  }
-  showUploaded(blob);          // 确实发出去了才展示，否则会误以为已上传
-  armCapWatchdog();
+  // 成果 blob 挂到 window 上：真机排查时能直接在控制台拿到它，
+  // 以后要落地"保存"或"提交给业务后端"也是从这里取，不用再走一遍选帧。
+  window.__lastShot = blob;
+  showResult(blob);
+  finish();
 }
 
-/* 高清帧回执看门狗。
-   服务端对【已闭锁】的连接是静默丢弃、不回消息的（见 Conn.submit 里的 done 分支），
-   所以"发出去了但永远等不到回执"是真实存在的一条路径。没有这个超时就只能刷页面。 */
-let capTimer = null;
-function armCapWatchdog(){
-  clearCapWatchdog();
-  capTimer = setTimeout(() => {
-    capTimer = null;
-    if (!capturing) return;
-    capturing = false; resetPick();
-    banner('高清帧没有回执，继续对准重试…', 'bad');
-  }, CAP_ACK_TIMEOUT);
-}
-function clearCapWatchdog(){
-  if (capTimer){ clearTimeout(capTimer); capTimer = null; }
-}
-
-/* 把这次真正上传的那一帧显示出来（不是服务端回传的裁图）——
-   要判断"选帧选对没有、清不清晰"，看的就得是上传的原图。 */
+/* 展示选中的那一帧。这是【本地原始高清帧】，不是服务端矫正后的裁图 ——
+   要判断"选帧选对没有、清不清晰"，看的就得是这张原图。 */
 let shotUrl = null;
-function showUploaded(blob){
+function showResult(blob){
   if (shotUrl) URL.revokeObjectURL(shotUrl);   // 不回收的话每拍一次泄漏一张图
   shotUrl = URL.createObjectURL(blob);
   $('shot').src = shotUrl;
@@ -976,9 +913,6 @@ async function tick(){
     return;
   }
 
-  // 高清帧在途时先别继续推流，省得跟它抢上行
-  if (capturing) return;
-
   const blob = await grab();
   if (!blob) return;
 
@@ -991,12 +925,10 @@ let t0 = 0;
 function fpsText(){
   const dt = (performance.now() - t0)/1000;
   // 发送速率和回传速率分开看：一帧一答时两者被 RTT 锁在一起，
-  // 连续发送后发送速率应该稳定贴住当前档位，不再受 RTT 影响。
-  // 注意这两个数是【整段会话的均值】，自适应帧率下会是两档的混合，
-  // 所以末尾把当前档位也显示出来，方便看清有没有正常升降档。
+  // 连续发送后发送速率应该稳定贴住 FPS，不再受 RTT 影响。
+  // 这里统计的只是【推流】，本地 24fps 的打分不走网络、不计入。
   return (sent/Math.max(dt,.001)).toFixed(1) + ' / 回 '
        + (got/Math.max(dt,.001)).toFixed(1) + ' fps / 丢 ' + dropped
-       + '  档' + curFps
        + (ws && ws.bufferedAmount > 0 ? '  缓冲' + (ws.bufferedAmount/1024).toFixed(0) + 'KB' : '');
 }
 
@@ -1009,38 +941,29 @@ async function start(){
       return;
     }
   }
-  sent = 0; got = 0; dropped = 0; okStreak = 0; capturing = false; resetPick();
+  sent = 0; got = 0; dropped = 0; okStreak = 0; resetPick();
   maxSharp = 0; curMotion = 0;      // SHARP_REL 的基准按会话重新学
   t0 = performance.now();
-  curFps = 0;                       // 强制下面这次 setFps 真正建定时器
-  setFps(FPS_IDLE);                 // 还没看到目标，先按低档起
+  clearInterval(timer);
+  timer = setInterval(tick, 1000 / FPS);
 }
 function stop(){
-  clearInterval(timer); timer = null; curFps = 0;
-  resetPick();                      // 打分循环也一起停
-  clearCapWatchdog();               // 停了就没人等回执了，免得超时横幅盖掉正常提示
-}
-
-/* 切换推流帧率。定时器周期不能改，只能重建 —— 所以先比一下，
-   帧率没变就什么都不做（每收到一条结果都会调用这里）。 */
-function setFps(f){
-  if (f === curFps) return;
-  curFps = f;
-  clearInterval(timer);
-  timer = setInterval(tick, 1000 / f);
+  clearInterval(timer); timer = null;
+  resetPick();                      // 本地打分循环也一起停
 }
 
 $('btnStart').onclick = start;
 $('btnStop').onclick  = () => { stop(); banner('已停止', 'wait'); };
 
-// 重新识别：先让服务端解开闭锁，再重新开始推流
+// 重新识别。reset 现在只是保险：不发高清帧，服务端就永远不会闭锁，
+// 这条命令实际是空操作 —— 但留着，万一以后重新启用上传就不用再补。
 $('btnAgain').onclick = () => {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'reset'}));
   $('btnAgain').style.display = 'none';
   $('btnStart').style.display = '';
   $('shot').style.display = 'none'; $('empty').style.display = 'block';
   $('shotSize').textContent = '';
-  last = null; okStreak = 0; capturing = false; resetPick();
+  last = null; okStreak = 0; resetPick();
   ctx.clearRect(0,0,viewW,viewH);
   start();
 };
@@ -1080,7 +1003,7 @@ function setMode(m){
   $('shot').style.display='none'; $('empty').style.display='block';
   $('shotSize').textContent = '';
   $('btnAgain').style.display='none'; $('btnStart').style.display='';   // 换模式=重开一次抓拍
-  last = null; okStreak = 0; capturing = false; resetPick();
+  last = null; okStreak = 0; resetPick();
   ctx.clearRect(0,0,viewW,viewH);
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'config', mode:m}));
   // 证件用后置、人脸用前置，更符合实际使用。
