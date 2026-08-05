@@ -156,15 +156,17 @@ function captureAfter(){ return CAPTURE_AFTER_BY_MODE[mode] || 1; }
 // 候选帧数 ≈ 窗口时长 × SCORE_FPS ≈ 16 张，
 // 【一帧都不多等】—— 攒够合格帧的那一刻就出图。
 
-// 本地打分频率。纯手机端计算、一个字节都不上传，所以跟推流的 3fps 完全解耦：
-// 推流受上行和 GPU 约束只能低频，本地判高清清晰度想多密就多密。
-//
-// 优先用 requestVideoFrameCallback：摄像头【每出一张新帧】才回调一次，
-// 不会给同一帧重复打分。再按 SCORE_FPS 限一道流 ——
-// 实际生效的是 min(摄像头帧率, SCORE_FPS)：30fps 摄像头配 24 的上限，
-// 会稳定落在 22~24；60fps 摄像头则被压到 24，不白烧 CPU。
+// 本地打分频率。纯手机端计算、一个字节都不上传，跟推流帧率无关。
+// 优先用 requestVideoFrameCallback（摄像头每出一张新帧才回调，不给同一帧重复打分），
+// 再按这个值限流，所以实际频率 = min(摄像头帧率, SCORE_FPS)。
 // 不支持 rVFC 的浏览器退回定时器轮询，同样是这个频率。
-const SCORE_FPS   = 24;
+//
+// ⚠ 调这个值要知道代价：候选帧数 ≈ 选帧窗口 × SCORE_FPS。
+//   窗口在 3fps 推流下约 667ms，所以
+//     SCORE_FPS=24 -> 约 16 张候选，"挑最清晰"才真正有意义
+//     SCORE_FPS=3  -> 只有 2 张，等于在两张里二选一，选帧基本退化成没有
+//   另外采样间隔变长会让运动量测不准，见 MOTION_MAX 那段说明。
+const SCORE_FPS   = 3;
 
 // 清晰度用 Tenengrad（Sobel 梯度平方均值）：越清晰边缘越陡，梯度越大。
 // 只在【原始像素】的一小块上算，不缩放 —— 缩放本身就是低通滤波，会把
@@ -179,10 +181,21 @@ const SHARP_PATCH = 480;
    3 帧连续合格照样凑得出来。而 Tenengrad 只做【相对】比较（挑窗口里最好的），
    一窗全糊时它就老实挑出"最不糊的糊图"发出去。所以要两道绝对性的闸门：
 
-   MOTION_MAX：帧间运动量上限，专治手抖。读数≈【相邻两帧之间移动了几个像素】，
-     推导和实测见 scoreFrame()。合成图上静止是 0.29（噪声底噪）、1px 0.83、
-     3px 1.82、6px 3.05，所以 1.5 大致对应"两帧间动了 2px 出头"。
-     这个量与场景对比度无关，可以用固定阈值，但仍建议真机标一次。
+   MOTION_MAX：运动速度上限，专治手抖。单位是【像素/秒】，不是"每帧多少像素"——
+     必须除掉采样间隔，否则改 SCORE_FPS 会把这个阈值的含义一起改掉：
+     3fps 采样时两帧相隔 333ms，同样的手抖，帧间位移是 24fps 采样时的 8 倍。
+     推导和实测见 scoreFrame()。合成图上（480×480，σ=2 噪声）帧间位移读数
+     静止 0.29 / 1px 0.83 / 3px 1.82 / 6px 3.05，按 24fps 的 41.7ms 折算，
+     原来那个 1.5 px/帧 就是 36 px/s。
+
+     ⚠ 两点局限，真机标阈值前先知道：
+       1) 这个推导只在小位移下线性。6px 时读数已经只有 3.05（明显偏低），
+          位移再大就饱和。SCORE_FPS=3 时相邻帧隔 333ms，手持位移常远超 6px，
+          读数会顶在饱和区 —— 那时它只能当"动了/没动"的粗信号，数值不可信。
+          想要定量可靠，SCORE_FPS 至少要十几。
+       2) 36 px/s 是从合成图折算的，不是真机标定值。手持正常抖动很可能就超它，
+          导致一直被判 shake、最后走 PICK_TIMEOUT 降级出图。
+          真机第一件事就是看状态栏那个"动"值，按实际分布调。
    SHARP_REL：专治【没对上焦】—— 那种情况运动量很低，MOTION_MAX 拦不住，
      但清晰度会明显低于这台设备在这个场景下能达到的水平。所以拿"本次会话
      见过的最高分"当基准，要求候选至少达到它的这个比例。
@@ -194,7 +207,7 @@ const SHARP_PATCH = 480;
    PICK_TIMEOUT：等不到合格帧的上限。超时就把手上最好的那张【降级出图】——
      宁可给一张不够理想的，也不要在这儿死等到用户以为程序卡了。
      被降级的原因会打到 console，真机排查时看那里。 */
-const MOTION_MAX   = 1.5;    // ≈ 帧间位移像素数（噪声底噪约 0.3）
+const MOTION_MAX   = 36;     // 像素/秒（≈ 24fps 下 1.5 px/帧；噪声底噪约 7 px/s）
 const SHARP_REL    = 0.70;
 const PICK_TIMEOUT = 2500;   // ms
 
@@ -247,7 +260,9 @@ let curMotion = 0;       // 最近一帧的运动量（只用于状态栏显示/
 let maxSharp = 0;        // 本次会话见过的最高分，SHARP_REL 的基准
 let pickStart = 0;       // 本轮选帧起始时刻，用于 PICK_TIMEOUT
 let pickRoi = null;      // 冻结的打分区域 {x,y,n}，见 startPick()
-let prevGray = null;     // 上一帧的灰度块，用来算帧间运动量
+// 灰度块双缓冲：每帧复用，不 new。hasPrev=false 表示还没有可比的上一帧。
+// prevAt 是上一帧打分的时刻，用来把帧间位移换算成像素/秒。
+let grayCur = null, grayPrev = null, hasPrev = false, prevAt = 0;
 let zoomApplied = null;  // 实际生效的 zoom 倍数（不支持 zoom 约束则为 null）
 let last = null;   // 最近一次结果，用于画框
 let viewW = 0, viewH = 0;   // 取景区的 CSS 像素尺寸（画框坐标就用这个坐标系）
@@ -590,7 +605,7 @@ function onMsg(m){
       const late = performance.now() - pickStart > PICK_TIMEOUT;
       if (!why || late){
         if (why) console.log('[pick] 超时降级出图，被拦原因:', why,
-                             'motion=' + bestMotion.toFixed(2),
+                             'motion=' + bestMotion.toFixed(0) + 'px/s',
                              'sharp=' + bestScore.toFixed(0) + '/' + maxSharp.toFixed(0));
         finishing = true;
         picking = false; stopScoring();
@@ -601,11 +616,12 @@ function onMsg(m){
   $('sStreak').textContent = okStreak + '/' + captureAfter()
       + (picking ? '  候选 ' + picked : '');
 
-  // 标 MOTION_MAX / SHARP_REL 就看这一行：手稳时"动"应该在 0.3~0.8（接近噪声底噪），
-  // 故意晃一晃看它涨到多少，阈值取两者中间。锐度那两个数是"最佳候选 / 会话最高"。
+  // 标 MOTION_MAX / SHARP_REL 就看这一行。"动"的单位是 px/s：手稳时应贴近噪声
+  // 底噪（几 px/s），故意晃一晃看它涨到多少，MOTION_MAX 取两者中间。
+  // 锐度那两个数是"最佳候选 / 会话最高"，SHARP_REL 就是这两者的比值门槛。
   $('sLocal').textContent = bestScore < 0 ? '-'
       : bestScore.toFixed(0) + ' / ' + maxSharp.toFixed(0)
-        + '   动 ' + curMotion.toFixed(2) + '（选中帧 ' + bestMotion.toFixed(2) + '）';
+        + '   动 ' + curMotion.toFixed(0) + '（选中帧 ' + bestMotion.toFixed(0) + '）px/s';
 
   // 打分耗时。24fps 的周期是 41.7ms，均值超过 10ms 就说明这块开销明显了
   // （它跑在主线程上，会和推流的 JPEG 编码抢时间）—— 那就把 SHARP_PATCH 调小。
@@ -731,19 +747,23 @@ function scoreFrame(){
   if (!roi) return { sharp: 0, motion: 0 };
   const n = roi.n;
 
-  shC.width = n; shC.height = n;
+  // 注意这里【没有】shC.width = n。给 canvas 赋宽高会重新分配整块后备存储并清空，
+  // 24fps 下每帧都做一次是白扔的开销（还可能连带 GPU 纹理重建，是主线程卡顿的
+  // 常见来源）。尺寸整轮不变，已经在 startPick() 里设好了。
   shctx.drawImage(v, roi.x, roi.y, n, n, 0, 0, n, n);   // 1:1，不缩放
   const d = shctx.getImageData(0, 0, n, n).data;
 
   // 先转灰度：整型权重 (77,150,29)/256 ≈ BT.601，比浮点快。
   // 帧间绝对差顺手在这一趟里累加，省一次遍历。
-  const g = new Uint8Array(n * n);
-  const canDiff = prevGray && prevGray.length === g.length;
+  //
+  // 灰度缓冲【双份复用】，不是每帧 new：480×480 是 230KB，24fps 下
+  // 每秒制造 5.5MB 垃圾，GC 压力直接变成手机上的掉帧。
+  const g = grayCur, prev = grayPrev, canDiff = hasPrev;
   let diff = 0;
   for (let i = 0, p = 0; i < g.length; i++, p += 4){
     const y = (d[p] * 77 + d[p+1] * 150 + d[p+2] * 29) >> 8;
     g[i] = y;
-    if (canDiff) diff += Math.abs(y - prevGray[i]);
+    if (canDiff) diff += Math.abs(y - prev[i]);
   }
 
   // Tenengrad（梯度平方均值）和梯度强度（|gx|+|gy| 均值）一趟算完，
@@ -776,19 +796,28 @@ function scoreFrame(){
   //   静止 0.29（这就是噪声底噪） | 1px 0.83 | 3px 1.82 | 6px 3.05
   //   低对比度 3px 1.73 vs 高对比度 3px 1.82  -> 确认与对比度无关
   //   已散焦 + 1px 0.68 vs 清晰 + 1px 0.83   -> 散焦不会把读数抬高
+  // 最后除掉两帧的真实时间间隔，换成【像素/秒】。这样 SCORE_FPS 怎么调，
+  // MOTION_MAX 的含义都不变；用实测间隔而不是 1000/SCORE_FPS，因为限流和
+  // 摄像头帧率会让实际间隔偏离标称值。
+  const now = performance.now();
   let motion = 0;
-  if (canDiff) motion = 8 * (diff / g.length) / Math.max(gradAbs / inner, 1);
-  prevGray = g;
+  if (canDiff){
+    const px = 8 * (diff / g.length) / Math.max(gradAbs / inner, 1);
+    const dtSec = Math.max((now - prevAt) / 1000, 1 / 240);   // 下限防除零
+    motion = px / dtSec;
+  }
+  prevAt = now;
+
+  // 交换两块缓冲：这一帧变成"上一帧"，原来的上一帧下次被覆写。不产生新对象。
+  grayCur = prev; grayPrev = g; hasPrev = true;
   return { sharp, motion };
 }
 
 /* 把当前帧按高清尺寸存进 bestC，作为目前的最佳候选。
-   记下时刻 —— 上传的是这张【存下来的旧帧】，多旧必须能查，见 BEST_MAX_AGE。 */
+   尺寸同样在 startPick() 里设好，这里只画 —— 一轮选帧里 snapBest 可能被调很多次
+   （每次刷新最佳都调），每次重设宽高就是每次重新分配 960×720 的后备存储。
+   记下时刻 —— 出的是这张【存下来的旧帧】，多旧必须能查，见 BEST_MAX_AGE。 */
 function snapBest(){
-  const vw = v.videoWidth, vh = v.videoHeight;
-  const s = CAP_LONG / Math.max(vw, vh);
-  bestC.width  = Math.round(vw * s);
-  bestC.height = Math.round(vh * s);
   bctx.drawImage(v, 0, 0, bestC.width, bestC.height);
   bestAt = performance.now();
 }
@@ -819,7 +848,7 @@ function pickStep(){
 }
 
 /* 现在能不能拍？返回拦下来的原因，null = 可以拍。
-   第一帧（prevGray 还没建立）运动量恒为 0，会被当成"很稳"，但那一帧同时也是
+   第一帧（hasPrev 还是 false）运动量恒为 0，会被当成"很稳"，但那一帧同时也是
    唯一的候选，拦它没有意义 —— 真在抖的话紧随其后的帧会把 bestMotion 顶上去。 */
 function pickBlocker(){
   if (bestScore < 0) return null;                              // 一张候选都没有，别拦
@@ -864,12 +893,26 @@ function startPick(){
   picking = true; picked = 0; bestScore = -1; bestMotion = 0;
   pickStart = performance.now();
   pickRoi = computeRoi();     // 整轮冻结，见 scoreFrame()
-  prevGray = null;            // 换了区域，上一帧的块不能再拿来做差
+  hasPrev = false;            // 换了区域，上一帧的块不能再拿来做差
+
+  // 两块画布的尺寸和灰度缓冲【每轮只设一次】，之后 24fps 的循环里一次都不再碰。
+  // 给 canvas 赋宽高会重新分配后备存储并清空，放在每帧里是主线程卡顿的常见来源。
+  if (pickRoi){
+    const n = pickRoi.n;
+    if (shC.width !== n){ shC.width = n; shC.height = n; }
+    if (grayCur === null || grayCur.length !== n * n){
+      grayCur = new Uint8Array(n * n);
+      grayPrev = new Uint8Array(n * n);
+    }
+    const vw = v.videoWidth, vh = v.videoHeight, s = CAP_LONG / Math.max(vw, vh);
+    const bw = Math.round(vw * s), bh = Math.round(vh * s);
+    if (bestC.width !== bw || bestC.height !== bh){ bestC.width = bw; bestC.height = bh; }
+  }
   startScoring();
 }
 function resetPick(){
   picking = false; picked = 0; bestScore = -1; bestMotion = 0;
-  pickRoi = null; prevGray = null;
+  pickRoi = null; hasPrev = false;
   stopScoring();
 }
 
@@ -890,7 +933,7 @@ async function finishPick(){
   console.log('[pick] 出图: 帧龄=' + age.toFixed(0) + 'ms'
             + ' 选帧耗时=' + (performance.now() - pickStart).toFixed(0) + 'ms'
             + ' 候选=' + picked
-            + ' motion=' + bestMotion.toFixed(2)
+            + ' motion=' + bestMotion.toFixed(0) + 'px/s'
             + ' sharp=' + bestScore.toFixed(0) + '/' + maxSharp.toFixed(0));
   lastAge = age;
 
