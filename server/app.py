@@ -35,7 +35,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from card_detector import CardPoseDetector, CardTracker, PoseRule   # noqa: E402
+from card_detector import (CardPoseDetector, CardTracker, PoseRule,  # noqa: E402
+                           REASON_TEXT as CARD_TEXT, tenengrad)
 from face_detector import FaceDetector, FaceRule                # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -170,6 +171,20 @@ def process_capture(bgr: np.ndarray, mode: str) -> dict:
         # 高清帧没通过就不闭锁，让客户端继续推流重试
         return payload
     card = CardPoseDetector.warp(bgr, r.quad)
+
+    # 清晰度闸门。判的是【矫正后的裁图】，也就是真正交给下游 OCR 的那张图，
+    # 而不是原始上传帧 —— 背景清不清楚无所谓，证件本体清楚才有意义。
+    #
+    # 姿态判定完全测不出运动模糊（手一直抖但证件摆得端正，rot/skew/aspect 全过），
+    # 所以没有这道闸门的话，糊图会一路通过并 final 闭锁，用户以为成功了。
+    # 被这里拒掉【不闭锁】，客户端会继续推流重试，见 Conn.done。
+    sharp = tenengrad(card)
+    payload["sharp"] = round(sharp, 1)
+    lim = card_det.rule.min_sharpness
+    if lim > 0 and sharp < lim:
+        payload.update(reason="blurry", msg=CARD_TEXT["blurry"])
+        return payload
+
     payload.update(ok=True, final=True, image=_b64(_jpeg(card)),
                    image_size=[card.shape[1], card.shape[0]])
     return payload
