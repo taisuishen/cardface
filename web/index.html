@@ -99,17 +99,18 @@
 </div>
 
 <script>
-// "凑够连续合格帧"的等待 = 帧数 × 帧间隔，24fps 下 3 帧只要 125ms（10fps 时 300ms）。
-// 选帧窗口同样按帧间隔走，帧率越高候选越多、越可能挑到清晰的那张。
-//
-// 两个代价，都在可接受范围内：
-//   上行：流式帧 7KB × 24 = 168KB/s（10fps 时 70KB/s）。手机上行常有 ~300KB/s，
-//         够用；不够时 bufferedAmount 背压会自动丢帧，不会越堆越延迟。
-//   服务端：GPU 单帧 24~40ms ≈ 25~40fps，单连接 24fps 基本吃满一张卡。
-//         服务端是 latest-wins（新帧覆盖没处理完的旧帧），吃不下只会丢帧、
-//         不会排队堆积，但【多人并发时人均帧率会掉】—— MAX_USERS=20 那套
-//         容量估算是按 10fps 做的，真要多人同时用得重新压测。
-const FPS         = 60;           // 每秒发送帧数
+/* 两个节拍是分开的，别混：
+
+   FPS       = 【推流】给服务端的帧率。服务端只回答一件事："拍正了没有"
+               （姿态判定 + 实时提示），这个不需要密集采样 —— 手不会在 300ms 内
+               把证件从歪转成正。3fps 下上行只有 7KB × 3 = 21KB/s，GPU 也几乎不占，
+               省下来的带宽全留给最后那张 ~100KB 的高清帧。
+   SCORE_FPS = 【本地】算 Tenengrad 挑清晰帧的频率。清晰度和姿态相反，是逐帧剧烈
+               抖动的（手抖、对焦呼吸），必须密集采样才逮得到清楚的那一帧。
+               纯手机端计算，一个字节都不上传，所以完全不受上行和 GPU 限制。
+
+   分工就是：低频问服务端"正不正"，高频在本地挑"清不清楚"。 */
+const FPS         = 3;            // 每秒【推流】帧数
 
 // 两级分辨率：
 //   流式帧只用来做姿态判定和实时提示 —— 实测把长边从 960 降到 416、质量降到 60，
@@ -126,9 +127,11 @@ const CAP_LONG    = 960, CAP_Q     = 0.90;
 const CAP_MAX_KB  = 110;          // 体积上限，超了自动降质量重编（留点余量，落点≈100KB）
 
 // 连续几帧合格后自动上传高清帧。
-// 证件 3 帧：避免抓到正在移动的那一瞬。24fps 下这 3 帧只花 125ms，
-// 不再是延迟瓶颈，所以没必要为了快而降到 2 帧。
-// （另外高清帧到服务端还会被【无状态严格重判】，抓歪了照样拒且不闭锁。）
+// 证件 3 帧：避免抓到正在移动的那一瞬。
+// ⚠ 3fps 下这 3 帧要 1 秒，是目前【最大的一块延迟】（10fps 时才 300ms）。
+//   想更快就把这里改成 2（省 333ms），代价是更容易抓到正在移动的那一瞬 ——
+//   不过高清帧到服务端还会被【无状态严格重判】，抓歪了照样拒且不闭锁，
+//   所以降到 2 的风险其实不大，值得真机试一把。
 // 人脸 1 帧：大小/角度/清晰度这些判定项本身已经挡掉不合格的了。
 const CAPTURE_AFTER_BY_MODE = { card: 3, face: 1 };
 function captureAfter(){ return CAPTURE_AFTER_BY_MODE[mode] || 1; }
@@ -140,8 +143,17 @@ function captureAfter(){ return CAPTURE_AFTER_BY_MODE[mode] || 1; }
 // 差出好几倍（对焦呼吸、快门期间的位移）。服务端只对上传的那一张做判定，
 // 抓到糊的那张就直接影响 OCR，而且它自己看不出"下一帧其实更清楚"。
 //
-// 选帧窗口 = 第 1 个到第 3 个合格帧之间，候选帧数 ≈ 窗口时长 × FPS，
+// 选帧窗口 = 第 1 个到第 3 个合格帧之间，候选帧数 ≈ 窗口时长 × SCORE_FPS，
 // 【一帧都不多等】—— 攒够合格帧的那一刻就发，和不选帧时一样快。
+
+// 打分频率。这是纯本地计算（一个字节都不上传），所以跟推流帧率完全解耦：
+// 推流受上行和 GPU 限制只能 24，本地想看多快看多快，看得越密候选越多。
+//
+// 优先用 requestVideoFrameCallback：摄像头【每出一张新帧】才回调一次，
+// 不重复给同一帧打分。手机摄像头通常只有 30fps，用 60Hz 定时器去轮询的话
+// 有一半在给同一帧重复算 Tenengrad，白烧 CPU 还挤占编码时间。
+// 不支持 rVFC 的浏览器才退回定时器，按 SCORE_FPS 轮询。
+const SCORE_FPS   = 60;
 
 // 清晰度用 Tenengrad（Sobel 梯度平方均值）：越清晰边缘越陡，梯度越大。
 // 只在【原始像素】的一小块上算，不缩放 —— 缩放本身就是低通滤波，会把
@@ -154,8 +166,8 @@ const SHARP_PATCH = 480;
 //
 // 阈值 = 最多容忍多少排队延迟。积压 B 字节、上行 U 字节/秒，新帧就要多等 B/U 秒。
 // 手机上行常只有 ~300KB/s，所以按"最多 ~100ms 排队"取值：
-// 24KB / 300KB/s ≈ 80ms 排队。这个判据只跟积压字节和上行带宽有关、
-// 跟发送帧率无关，所以从 10fps 提到 24fps 不用改（只是会更频繁地触发丢帧）。
+// 24KB / 300KB/s ≈ 80ms 排队。这个判据只跟积压字节和上行带宽有关、跟发送帧率
+// 无关，所以 FPS 怎么调都不用改（3fps 下 21KB/s，基本永远不会触发）。
 // （注意别按 100KB 的老尺寸去算，那样 3 帧就是 1 秒排队，比一帧一答还慢。）
 const MAX_BUFFERED= 24 * 1024;
 
@@ -515,9 +527,9 @@ function onMsg(m){
     if (!m.ok){
       resetPick();                         // 证件动了/脱框了：候选作废，重新数
     } else {
-      if (!picking && !capturing){ picking = true; picked = 0; bestScore = -1; }
+      if (!picking && !capturing) startPick();
       if (okStreak >= captureAfter() && !capturing){
-        picking = false;
+        picking = false; stopScoring();
         sendCapture();
       }
     }
@@ -658,7 +670,7 @@ function snapBest(){
   bctx.drawImage(v, 0, 0, bestC.width, bestC.height);
 }
 
-/* 每个推流周期评估一帧，比目前最好的还清晰就替换掉。
+/* 评估一帧，比目前最好的还清晰就替换掉。
    必须【同步】跑完评分和存帧，中间不能 await —— 否则视频已经翻到下一帧，
    存下来的就不是打分的那一帧了。
    什么时候停由 onMsg 决定（攒够合格帧就发），这里不管。 */
@@ -668,7 +680,31 @@ function pickStep(){
   if (s > bestScore){ bestScore = s; snapBest(); }
 }
 
-function resetPick(){ picking = false; picked = 0; bestScore = -1; }
+/* 本地打分循环，和推流的 setInterval(tick) 各跑各的。
+   跑得比推流快是有意义的：候选越密，越可能逮到手抖间隙里那张清楚的。 */
+let scoreVfc = 0, scoreTimer = null;
+function startScoring(){
+  stopScoring();
+  if (typeof v.requestVideoFrameCallback === 'function'){
+    const step = () => {
+      scoreVfc = 0;
+      if (!picking) return;              // 已经拍完或作废了，自然结束
+      pickStep();
+      scoreVfc = v.requestVideoFrameCallback(step);
+    };
+    scoreVfc = v.requestVideoFrameCallback(step);
+  } else {
+    scoreTimer = setInterval(() => { if (picking) pickStep(); }, 1000 / SCORE_FPS);
+  }
+}
+function stopScoring(){
+  if (scoreVfc && v.cancelVideoFrameCallback) v.cancelVideoFrameCallback(scoreVfc);
+  scoreVfc = 0;
+  if (scoreTimer){ clearInterval(scoreTimer); scoreTimer = null; }
+}
+
+function startPick(){ picking = true; picked = 0; bestScore = -1; startScoring(); }
+function resetPick(){ picking = false; picked = 0; bestScore = -1; stopScoring(); }
 
 /* 攒够合格帧后，把窗口里最清晰的那一帧作为高清帧上传，出最终裁图。
    先发 {"type":"capture"} 告诉服务端"下一个二进制帧按高清处理"，
@@ -711,12 +747,9 @@ function showUploaded(blob){
 async function tick(){
   if (!ws || ws.readyState !== 1) return;
 
-  // 选帧和推流用同一帧、同一个 FPS 节拍。放在背压判断【之前】：打分是纯本地
-  // 计算，不占上行，上行堵住时更不该跟着停 —— 否则网络一差就攒不到候选，
-  // 到该拍的那一刻只能退回"抓当前帧"。
-  // 必须同步跑完（pickStep 内部不 await），否则视频已经翻到下一帧，
-  // 存下来的就不是打分的那一帧了。
-  if (picking && !capturing) pickStep();
+  // 注意：本地选帧【不在这里】，它跑在自己的 startScoring() 循环上。
+  // 故意分开的 —— 打分是纯本地计算不占上行，上行堵住时下面会 return 掉，
+  // 但打分不该跟着停，否则网络一差就攒不到候选、只能退回"抓当前帧"。
 
   // 连续发送，不等上一帧的结果。
   //
@@ -769,7 +802,7 @@ async function start(){
   clearInterval(timer);
   timer = setInterval(tick, 1000/FPS);
 }
-function stop(){ clearInterval(timer); timer = null; }
+function stop(){ clearInterval(timer); timer = null; resetPick(); }   // 打分循环也一起停
 
 $('btnStart').onclick = start;
 $('btnStop').onclick  = () => { stop(); banner('已停止', 'wait'); };
