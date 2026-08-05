@@ -95,6 +95,7 @@
       <tr><td>角点抖动 / 投票</td><td id="sJit">-</td></tr>
       <tr><td>连续合格 / 触发</td><td id="sStreak">-</td></tr>
       <tr><td>本地锐度 / 运动量</td><td id="sLocal">-</td></tr>
+      <tr><td>打分耗时 均/峰</td><td id="sScoreMs">-</td></tr>
     </table>
   </div>
 </div>
@@ -239,6 +240,9 @@ let picked = 0;          // 已评估的候选帧数
 let bestScore = -1;      // 目前最高的 Tenengrad 分数（-1 = 还没有候选）
 let bestMotion = 0;      // 最佳候选那一帧自己的帧间运动量
 let bestAt = 0;          // 最佳候选是什么时候存下来的，见 BEST_MAX_AGE
+let finishing = false;   // 本轮已出图，后续在途结果一律忽略（一轮只出一张）
+let lastAge = 0;         // 出图帧龄(ms)：那张图是多久以前拍的，排查延迟就看它
+let scoreMs = 0, scoreMsMax = 0;   // 单帧打分耗时：EMA 均值 / 峰值
 let curMotion = 0;       // 最近一帧的运动量（只用于状态栏显示/标阈值）
 let maxSharp = 0;        // 本次会话见过的最高分，SHARP_REL 的基准
 let pickStart = 0;       // 本轮选帧起始时刻，用于 PICK_TIMEOUT
@@ -568,17 +572,27 @@ function onMsg(m){
   okStreak = m.ok ? okStreak + 1 : 0;
   if (!m.ok){
     resetPick();                           // 证件动了/脱框了：候选作废，重新数
-  } else {
+  } else if (!finishing){
+    // finishing 之后一律不再处理：这一轮已经出图了。
+    // 少了这个判断会出【一个真实的 bug】—— 停止发送只是不再发新帧，已经在路上的
+    // 帧还会陆续回结果。每一条都会走到这里，看到 !picking 就 startPick()（bestScore
+    // 归 -1），紧接着 okStreak 仍 >= 3、pickBlocker 因为"没有候选"返回 null，
+    // 于是又出一次图，而且这次是 snapBest() 抓的【当前】画面、没过任何闸门。
+    // 表现就是证件早已移开，几百毫秒后又冒出一张"已采集"。
     if (!picking) startPick();
     // 攒够合格帧【且】手上这张够干净才出图；不够就把窗口顺延，继续攒。
     // 用户手稳时这两个闸门一次就过，行为和不设闸门时完全一样、不多等一帧。
     if (okStreak >= captureAfter()){
+      // 一个候选都还没攒到就先同步打一帧的分（约 5ms），别让闸门空判 ——
+      // bestScore<0 时 pickBlocker 会直接放行，等于把一张没检验过的帧交出去。
+      if (bestScore < 0) pickStep();
       const why = pickBlocker();
       const late = performance.now() - pickStart > PICK_TIMEOUT;
       if (!why || late){
         if (why) console.log('[pick] 超时降级出图，被拦原因:', why,
                              'motion=' + bestMotion.toFixed(2),
                              'sharp=' + bestScore.toFixed(0) + '/' + maxSharp.toFixed(0));
+        finishing = true;
         picking = false; stopScoring();
         finishPick();
       }
@@ -592,6 +606,13 @@ function onMsg(m){
   $('sLocal').textContent = bestScore < 0 ? '-'
       : bestScore.toFixed(0) + ' / ' + maxSharp.toFixed(0)
         + '   动 ' + curMotion.toFixed(2) + '（选中帧 ' + bestMotion.toFixed(2) + '）';
+
+  // 打分耗时。24fps 的周期是 41.7ms，均值超过 10ms 就说明这块开销明显了
+  // （它跑在主线程上，会和推流的 JPEG 编码抢时间）—— 那就把 SHARP_PATCH 调小。
+  $('sScoreMs').textContent = scoreMs
+      ? scoreMs.toFixed(1) + ' / ' + scoreMsMax.toFixed(1) + ' ms'
+        + '   占 ' + (scoreMs * SCORE_FPS / 10).toFixed(0) + '%'
+      : '-';
 
   // 被闸门拦下时要说清楚是"抖"还是"没对上焦"，否则用户看到一直提示
   // "证件已对准"却不出结果，只会以为程序卡了。
@@ -781,7 +802,14 @@ function pickStep(){
   // 候选过期就作废，让当前帧重新当最佳 —— 只在最近 BEST_MAX_AGE 内的帧里挑。
   if (bestScore >= 0 && now - bestAt > BEST_MAX_AGE) bestScore = -1;
 
+  // 打分耗时实测。桌面 V8 上纯计算 1.69ms/帧（480×480），但真机还要算上
+  // getImageData 的 GPU 回读（921KB），那部分只能在设备上量 —— 所以这里直接量。
+  const t0 = performance.now();
   const { sharp, motion } = scoreFrame();
+  const dt = performance.now() - t0;
+  scoreMs = scoreMs ? scoreMs * 0.9 + dt * 0.1 : dt;    // EMA，看稳态
+  if (dt > scoreMsMax) scoreMsMax = dt;                 // 峰值，看有没有偶发卡顿
+
   picked++;
   curMotion = motion;
   if (sharp > maxSharp) maxSharp = sharp;
@@ -848,16 +876,23 @@ function resetPick(){
 /* 攒够合格帧后出图。【全程本地】：不上传，只把窗口里最清晰的那一帧编码出来展示。
    服务端的角色只剩"这一帧摆正了没有"，最终这张图不再过网络。 */
 async function finishPick(){
-  // 一个候选都没攒到就直接用当前帧（人脸模式 captureAfter=1 本来就没有窗口；
-  // 证件模式则是几个合格回执挤在同一个 tick 间隔里到达，来不及打分）。
-  if (bestScore < 0){
-    snapBest();
-  } else if (performance.now() - bestAt > BEST_MAX_AGE){
-    // 兜底断言：pickStep 的过期逻辑本该保证不会走到这儿。宁可这次不出图、
-    // 重新攒一轮，也不要拿一张明显过期的帧交差。
+  const age = performance.now() - bestAt;
+  // 兜底断言，两种都不该发生（调用方已经保证有候选、pickStep 会清过期的）。
+  // 宁可这一轮不出图、重新攒，也不要拿一张没检验过或明显过期的帧交差。
+  if (bestScore < 0 || age > BEST_MAX_AGE){
+    console.warn('[pick] 放弃出图: bestScore=' + bestScore.toFixed(0)
+               + ' 帧龄=' + age.toFixed(0) + 'ms');
+    finishing = false;
     resetPick();
     return;
   }
+  // 出图帧龄 = 这张图是多久以前拍的。排查"移开后才成功"就看这个数。
+  console.log('[pick] 出图: 帧龄=' + age.toFixed(0) + 'ms'
+            + ' 选帧耗时=' + (performance.now() - pickStart).toFixed(0) + 'ms'
+            + ' 候选=' + picked
+            + ' motion=' + bestMotion.toFixed(2)
+            + ' sharp=' + bestScore.toFixed(0) + '/' + maxSharp.toFixed(0));
+  lastAge = age;
 
   // 体积上限：证件细纹/防伪底纹很多，同样质量下比普通照片大不少
   // （真机实测 q92 到过 177KB；细节极端的图 q82 还能到 240KB，
@@ -887,7 +922,10 @@ function showResult(blob){
   $('shot').src = shotUrl;
   $('shot').style.display = 'block';
   $('empty').style.display = 'none';
-  $('shotSize').textContent = '（' + (blob.size/1024).toFixed(0) + ' KB）';
+  // 帧龄一起显示出来：如果你觉得"移开之后才成功"，这个数就是证据 ——
+  // 它是这张图拍摄到出图的间隔，正常应该在 BEST_MAX_AGE 以内。
+  $('shotSize').textContent = '（' + (blob.size/1024).toFixed(0) + ' KB，帧龄 '
+                            + lastAge.toFixed(0) + 'ms）';
 }
 
 async function tick(){
@@ -941,8 +979,9 @@ async function start(){
       return;
     }
   }
-  sent = 0; got = 0; dropped = 0; okStreak = 0; resetPick();
+  sent = 0; got = 0; dropped = 0; okStreak = 0; finishing = false; resetPick();
   maxSharp = 0; curMotion = 0;      // SHARP_REL 的基准按会话重新学
+  scoreMs = 0; scoreMsMax = 0;      // 耗时统计也按会话重新算
   t0 = performance.now();
   clearInterval(timer);
   timer = setInterval(tick, 1000 / FPS);
@@ -963,7 +1002,7 @@ $('btnAgain').onclick = () => {
   $('btnStart').style.display = '';
   $('shot').style.display = 'none'; $('empty').style.display = 'block';
   $('shotSize').textContent = '';
-  last = null; okStreak = 0; resetPick();
+  last = null; okStreak = 0; finishing = false; resetPick();
   ctx.clearRect(0,0,viewW,viewH);
   start();
 };
@@ -1003,7 +1042,7 @@ function setMode(m){
   $('shot').style.display='none'; $('empty').style.display='block';
   $('shotSize').textContent = '';
   $('btnAgain').style.display='none'; $('btnStart').style.display='';   // 换模式=重开一次抓拍
-  last = null; okStreak = 0; resetPick();
+  last = null; okStreak = 0; finishing = false; resetPick();
   ctx.clearRect(0,0,viewW,viewH);
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'config', mode:m}));
   // 证件用后置、人脸用前置，更符合实际使用。
