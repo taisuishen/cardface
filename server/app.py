@@ -1,407 +1,1079 @@
-"""证件 / 人脸 WebSocket 识别服务。
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>证件 / 人脸识别</title>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;background:#0d1117;color:#e6edf3;font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+       padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+  header{display:flex;align-items:center;gap:8px;padding:10px 12px;background:#161b22;border-bottom:1px solid #30363d;
+         position:sticky;top:0;z-index:20}
+  header b{font-size:15px}
+  #dot{width:9px;height:9px;border-radius:50%;background:#f85149;flex:none;transition:background .2s}
+  #dot.on{background:#3fb950}
+  .tabs{display:flex;margin-left:auto;background:#0d1117;border:1px solid #30363d;border-radius:8px;overflow:hidden}
+  .tabs button{background:none;border:0;color:#8b949e;padding:6px 14px;font-size:14px;font-family:inherit}
+  .tabs button.act{background:#1f6feb;color:#fff}
 
-协议
-----
-客户端 -> 服务端
-  * 文本 JSON 控制帧：{"type":"config","mode":"card"|"face"}
-  * 二进制帧：一张 JPEG 图（约 100KB），按 mode 处理
+  #stage{position:relative;width:100%;background:#000;overflow:hidden}
+  video,#ov{position:absolute;inset:0;width:100%;height:100%}
+  video{object-fit:cover}
+  #ov{pointer-events:none}
+  #banner{position:absolute;left:0;right:0;bottom:0;padding:14px 12px;font-size:17px;font-weight:600;text-align:center;
+          background:linear-gradient(transparent,rgba(0,0,0,.85));text-shadow:0 1px 3px #000}
+  #banner.ok{color:#3fb950}#banner.bad{color:#ffa657}#banner.wait{color:#e6edf3}
 
-服务端 -> 客户端
-  {"type":"hello", "backend":..., "providers":[...], "imgsz":960}
-  {"type":"result","mode":"card","ok":true,"msg":"Card aligned","reason":"ok",
-   "conf":0.93,"rotate_deg":1.2,"skew":0.03,"quad":[[x,y]x4],
-   "image":"data:image/jpeg;base64,...","ms":38,"seq":17,"dropped":2}
-  {"type":"result","mode":"card","ok":false,"msg":"Card is tilted. Align it with the frame","reason":"tilted",...}
-  {"type":"error","msg":...}
+  .panel{padding:12px}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .btn{flex:1;min-width:110px;padding:11px;border-radius:8px;border:1px solid #30363d;background:#21262d;color:#e6edf3;
+       font-size:14px;font-family:inherit}
+  .btn.pri{background:#238636;border-color:#2ea043;font-weight:600}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:10px;margin-bottom:10px}
+  .card h3{margin:0 0 8px;font-size:13px;color:#8b949e;font-weight:600}
+  #shot{width:100%;border-radius:6px;display:none;background:#000}
+  #empty{color:#484f58;font-size:13px;text-align:center;padding:22px 0}
+  table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
+  td{padding:3px 0;border-bottom:1px solid #21262d}
+  td:first-child{color:#8b949e;width:42%}
+  td:last-child{text-align:right;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  #err{display:none;margin:12px;padding:12px;border-radius:8px;background:#3d1d1d;border:1px solid #f85149;color:#ffa198;font-size:13px}
+  #err code{background:#00000055;padding:1px 4px;border-radius:3px;word-break:break-all}
+</style>
+</head>
+<body>
 
-只有 ok=true 且连续稳定帧达标时才带 image 字段回传。
-"""
-from __future__ import annotations
+<header>
+  <span id="dot"></span><b>证件 / 人脸识别</b>
+  <div class="tabs">
+    <button id="tabCard" class="act">证件</button>
+    <button id="tabFace">人脸</button>
+  </div>
+</header>
 
-import argparse
-import asyncio
-import base64
-import json
-import os
-import sys
-import time
-from contextlib import asynccontextmanager
-from datetime import datetime
+<div id="err"></div>
 
-import cv2
-import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+<div id="stage">
+  <video id="v" playsinline autoplay muted></video>
+  <canvas id="ov"></canvas>
+  <div id="banner" class="wait">点击下方「开始」</div>
+</div>
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from card_detector import (CardPoseDetector, CardTracker, PoseRule,  # noqa: E402
-                           REASON_TEXT as CARD_TEXT, tenengrad)
-from face_detector import FaceDetector, FaceRule                # noqa: E402
+<div class="panel">
+  <div class="row">
+    <button id="btnStart" class="btn pri">开始</button>
+    <button id="btnAgain" class="btn pri" style="display:none">重新识别</button>
+    <button id="btnStop" class="btn">停止</button>
+    <button id="btnCam" class="btn">前/后切换</button>
+  </div>
+  <div class="row">
+    <select id="camSel" class="btn"><option value="">摄像头：自动</option></select>
+    <button id="btnRec" class="btn">录 50 帧供排查</button>
+  </div>
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WEB_DIR = os.path.join(ROOT, "web")
+  <div class="card">
+    <h3>本地选中的高清帧 <span id="shotSize"></span></h3>
+    <img id="shot" alt="picked frame">
+    <div id="empty">这里显示本地挑出的那一帧高清图（不经过服务端）</div>
+  </div>
 
-MODEL_PATH = os.environ.get("CARD_MODEL", os.path.join(ROOT, "cardpose.onnx"))
-MODEL_DIR = os.environ.get("MODEL_DIR", os.path.join(ROOT, "models"))
-JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "88"))
-DUMP_ROOT = os.environ.get("DUMP_DIR", os.path.join(ROOT, "dumps"))
+  <div class="card">
+    <h3>实时状态</h3>
+    <table>
+      <tr><td>连接</td><td id="sWs">未连接</td></tr>
+      <tr><td>模式</td><td id="sMode">card</td></tr>
+      <tr><td>发送/回传帧率 丢帧</td><td id="sFps">-</td></tr>
+      <tr><td>推流帧大小</td><td id="sSize">-</td></tr>
+      <tr><td>服务端耗时</td><td id="sMs">-</td></tr>
+      <tr><td>往返延迟</td><td id="sRtt">-</td></tr>
+      <tr><td>判定</td><td id="sReason">-</td></tr>
+      <tr><td>置信度</td><td id="sConf">-</td></tr>
+      <tr><td>旋转角 / 倾斜</td><td id="sGeo">-</td></tr>
+      <tr><td>推理后端</td><td id="sBk">-</td></tr>
+      <tr><td>当前摄像头</td><td id="sCam">-</td></tr>
+      <tr><td>角点抖动 / 投票</td><td id="sJit">-</td></tr>
+      <tr><td>连续合格 / 触发</td><td id="sStreak">-</td></tr>
+      <tr><td>本地锐度 / 运动量</td><td id="sLocal">-</td></tr>
+      <tr><td>打分耗时 均/峰</td><td id="sScoreMs">-</td></tr>
+    </table>
+  </div>
+</div>
 
-card_det: CardPoseDetector | None = None
-face_det: FaceDetector | None = None
+<script>
+/* 两个节拍是分开的，别混：
 
-# 并发上限（过载保护）。实测单卡 24 并发持续推流丢帧 0.3%、32 并发 5%，
-# 所以默认留余量取 20。超过就用 close code 4429 拒掉新连接。
-MAX_USERS = int(os.environ.get("MAX_USERS", "20"))
+   推流帧率   = 问服务端"拍正了没有"（姿态判定 + 实时提示）。
+   SCORE_FPS = 【本地】算 Tenengrad 挑清晰帧的频率。清晰度和姿态相反，是逐帧剧烈
+               抖动的（手抖、对焦呼吸），必须密集采样才逮得到清楚的那一帧。
+               纯手机端计算，一个字节都不上传，所以完全不受上行和 GPU 限制。
 
-ACTIVE: set = set()          # 当前活跃连接
-_recent_ms: list = []        # 最近若干帧的服务端耗时，给 /stats 算分位用
+   分工就是：低频问服务端"正不正"，高频在本地挑"清不清楚"。
+
+   ---- 延迟构成，改帧率前先看这里 ----
+
+   出图要等【摆正之后的 5 个推流帧】，这 5 帧是两道闸门重叠出来的：
+     服务端投票 VOTE_WIN=4 / VOTE_NEED=3 —— 窗口里原本都是 False，
+       要连过 3 帧才第一次对外报 ok=true（见 CardTracker.step）
+     客户端 captureAfter=3 —— 还要再收到 3 个连续的 ok=true
+   所以延迟 = 5 × 帧间隔 = 3fps 下约 1.67 秒。
+
+   注意这只是【看起来慢】的那一半。以前还要再加高清帧上传（100KB ÷ 约 94KB/s
+   ≈ 1.1 秒），现在最终出图完全本地、不过网络，那 1.1 秒没了。
+   真嫌慢的话，优先动 captureAfter 和服务端 VOTE_NEED（各值 333ms），
+   而不是加帧率 —— 加帧率是拿带宽换延迟，改门槛是白捡的。 */
+const FPS         = 3;            // 每秒【推流】帧数，只用于问服务端"摆正了没有"
+
+// 两级分辨率，用途完全不同：
+//   流式帧【要上传】，只用来做姿态判定和实时提示 —— 实测把长边从 960 降到 416、
+//   质量降到 60，单帧从 51KB 掉到 7KB（省 86%），而检出率仍是 10/10、
+//   角点误差 17.8px vs 18.2px，基本没损失（模型反正会 letterbox 到 960，
+//   证件四角是粗特征）。
+const STREAM_LONG = 416, STREAM_Q  = 0.60;   // 约 5~7KB
+//   高清帧【不上传】，是本地挑出来的成果图。真实照片实测
+//   q92=106KB / q82=70KB / q75=58KB，PSNR 依次 44.3 / 41.6 / 40.2 dB，
+//   按"约 100KB"取 q90 起编。它不过网络，压体积只是给下游一个可控尺寸。
+const CAP_LONG    = 960, CAP_Q     = 0.90;
+const CAP_MAX_KB  = 110;          // 体积上限，超了自动降质量重编（留点余量，落点≈100KB）
+
+// 连续几帧合格后出图。
+// 证件 3 帧：避免抓到正在移动的那一瞬。
+// ⚠ 3fps 下这 3 帧要 1 秒，是目前【最大的一块延迟】。想更快就改成 2（省 333ms）。
+//   注意现在没有"服务端无状态重判"这道后置保险了（不再上传高清帧），
+//   抓歪了不会有人拦，所以降到 2 之前先真机看看出图质量。
+// 人脸 1 帧：大小/角度/清晰度这些判定项本身已经挡掉不合格的了。
+const CAPTURE_AFTER_BY_MODE = { card: 3, face: 1 };
+function captureAfter(){ return CAPTURE_AFTER_BY_MODE[mode] || 1; }
+
+// 从【第 1 个合格帧】起就逐帧算清晰度、记住最清晰的那一张；数到第
+// captureAfter() 个合格帧时，把已经挑好的那张直接出图。
+//
+// 为什么要挑：姿态合格 ≠ 这一帧清晰。手持时手机一直在微动，相邻帧的清晰度能
+// 差出好几倍（对焦呼吸、快门期间的位移）。而服务端只看 3fps 里那几帧的姿态，
+// 完全不知道哪一帧清楚 —— 清晰度这件事只有本地判得起。
+//
+// 选帧窗口 = 第 1 个到第 3 个合格帧之间（3fps 下约 667ms），
+// 候选帧数 ≈ 窗口时长 × SCORE_FPS ≈ 16 张，
+// 【一帧都不多等】—— 攒够合格帧的那一刻就出图。
+
+// 本地打分频率。纯手机端计算、一个字节都不上传，所以跟推流的 3fps 完全解耦：
+// 推流受上行和 GPU 约束只能低频，本地判高清清晰度想多密就多密。
+//
+// 优先用 requestVideoFrameCallback：摄像头【每出一张新帧】才回调一次，
+// 不会给同一帧重复打分。再按 SCORE_FPS 限一道流 ——
+// 实际生效的是 min(摄像头帧率, SCORE_FPS)：30fps 摄像头配 24 的上限，
+// 会稳定落在 22~24；60fps 摄像头则被压到 24，不白烧 CPU。
+// 不支持 rVFC 的浏览器退回定时器轮询，同样是这个频率。
+const SCORE_FPS   = 24;
+
+// 清晰度用 Tenengrad（Sobel 梯度平方均值）：越清晰边缘越陡，梯度越大。
+// 只在【原始像素】的一小块上算，不缩放 —— 缩放本身就是低通滤波，会把
+// "糊"和"清楚"的差别一起抹掉，正好毁掉我们要测的东西。
+// 取证件中心 480×480 的原尺寸方块：成本固定（约 23 万像素，真机 2~5ms），
+// 各候选帧的块大小一致，分数可以直接比。
+const SHARP_PATCH = 480;
+
+/* ---- 一直摇晃 / 一直没对上焦时，不许交付糊图 ----
+
+   姿态判定测不出运动模糊：手一直抖但证件摆得端正，rot/skew/aspect 全过，
+   3 帧连续合格照样凑得出来。而 Tenengrad 只做【相对】比较（挑窗口里最好的），
+   一窗全糊时它就老实挑出"最不糊的糊图"发出去。所以要两道绝对性的闸门：
+
+   MOTION_MAX：帧间运动量上限，专治手抖。读数≈【相邻两帧之间移动了几个像素】，
+     推导和实测见 scoreFrame()。合成图上静止是 0.29（噪声底噪）、1px 0.83、
+     3px 1.82、6px 3.05，所以 1.5 大致对应"两帧间动了 2px 出头"。
+     这个量与场景对比度无关，可以用固定阈值，但仍建议真机标一次。
+   SHARP_REL：专治【没对上焦】—— 那种情况运动量很低，MOTION_MAX 拦不住，
+     但清晰度会明显低于这台设备在这个场景下能达到的水平。所以拿"本次会话
+     见过的最高分"当基准，要求候选至少达到它的这个比例。
+     局限：如果一开始就一直糊，基准本身就低，这道闸门会失效 —— 只能靠 MOTION_MAX。
+     ⚠ 服务端那道 CARD_MIN_SHARP 现在【不参与】：它长在 process_capture 里，
+       而客户端已经不发高清帧了，那条路径永远不会被触发。也就是说清晰度这件事
+       现在【只有这两道前端闸门在管】，没有后置安全网。
+
+   PICK_TIMEOUT：等不到合格帧的上限。超时就把手上最好的那张【降级出图】——
+     宁可给一张不够理想的，也不要在这儿死等到用户以为程序卡了。
+     被降级的原因会打到 console，真机排查时看那里。 */
+const MOTION_MAX   = 1.5;    // ≈ 帧间位移像素数（噪声底噪约 0.3）
+const SHARP_REL    = 0.70;
+const PICK_TIMEOUT = 2500;   // ms
+
+/* 候选帧的保鲜期。上传的是【存在 bestC 里的旧帧】，不是发送那一刻的画面，
+   所以必须限制它能有多旧 —— 否则会出现这种事：
+
+     用户以为没拍上，把证件移开了 -> 几秒后突然显示"✓ 证件已采集"
+
+   原因是那张旧帧里证件端端正正，服务端照样判合格并 final 闭锁。等待越久越明显：
+   选帧最长等 PICK_TIMEOUT=2.5s，再加 100KB 高清帧的上传时间（RunPod 代理实测
+   约 94KB/s，≈1.1s），最坏情况上传的是 3.6 秒前的画面。
+
+   所以只在最近 BEST_MAX_AGE 内的帧里挑：过期就把 bestScore 清掉，让当前帧重新
+   当最佳。等于一个滑动窗口的"最清晰帧"，代价是丢掉窗口外那些更早的候选 ——
+   但那些帧本来就不该上传。600ms 在 30fps 摄像头下还有约 18 张候选，够挑。 */
+const BEST_MAX_AGE = 600;    // ms
 
 
-async def _send(ws: WebSocket, obj: dict):
-    """发一条下行控制帧。"""
-    await ws.send_text(json.dumps(obj, ensure_ascii=False))
+// 背压：只看"还没发出去的字节数"，不看有没有收到结果。
+//
+// 阈值 = 最多容忍多少排队延迟。积压 B 字节、上行 U 字节/秒，新帧就要多等 B/U 秒。
+// 手机上行常只有 ~300KB/s，所以按"最多 ~100ms 排队"取值：
+// 24KB / 300KB/s ≈ 80ms 排队。这个判据只跟积压字节和上行带宽有关、跟发送帧率
+// 无关，所以 FPS 怎么调都不用改（3fps 下 21KB/s，基本永远不会触发）。
+// （注意别按 100KB 的老尺寸去算，那样 3 帧就是 1 秒排队，比一帧一答还慢。）
+const MAX_BUFFERED= 24 * 1024;
 
+const $ = id => document.getElementById(id);
+const v = $('v'), ov = $('ov'), ctx = ov.getContext('2d');
+const cap = document.createElement('canvas'), cctx = cap.getContext('2d');
+// 选帧用的两块离屏画布：best 存目前最清晰的那一帧（高清尺寸，最后编码上传），
+// sh 是算 Tenengrad 的原尺寸小块。都跟 cap 分开，免得互相覆盖。
+const bestC = document.createElement('canvas'), bctx = bestC.getContext('2d');
+const shC = document.createElement('canvas');
+const shctx = shC.getContext('2d', { willReadFrequently: true });
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    global card_det, face_det
-    t0 = time.time()
-    card_det = CardPoseDetector(MODEL_PATH, PoseRule())
-    face_det = FaceDetector(MODEL_DIR, FaceRule())
-    print(f"[init] card providers={card_det.providers} imgsz={card_det.imgsz}")
-    print(f"[init] face backend={face_det.backend}")
-    print(f"[init] ready in {time.time() - t0:.1f}s")
-    yield
+let ws = null, stream = null, timer = null, pingTimer = null;
+let mode = 'card', facing = 'environment', deviceId = '';   // deviceId 为空 = 按 facing 自动选
+let sent = 0, got = 0, dropped = 0, lastSentAt = 0, lastCloseCode = 0;
+let okStreak = 0;        // 连续合格帧数，达到 CAPTURE_AFTER 就进入选帧
+let picking = false;     // 正在攒候选：第 1 个合格帧起，逐帧算清晰度留最好的
+let picked = 0;          // 已评估的候选帧数
+let bestScore = -1;      // 目前最高的 Tenengrad 分数（-1 = 还没有候选）
+let bestMotion = 0;      // 最佳候选那一帧自己的帧间运动量
+let bestAt = 0;          // 最佳候选是什么时候存下来的，见 BEST_MAX_AGE
+let finishing = false;   // 本轮已出图，后续在途结果一律忽略（一轮只出一张）
+let lastAge = 0;         // 出图帧龄(ms)：那张图是多久以前拍的，排查延迟就看它
+let scoreMs = 0, scoreMsMax = 0;   // 单帧打分耗时：EMA 均值 / 峰值
+let curMotion = 0;       // 最近一帧的运动量（只用于状态栏显示/标阈值）
+let maxSharp = 0;        // 本次会话见过的最高分，SHARP_REL 的基准
+let pickStart = 0;       // 本轮选帧起始时刻，用于 PICK_TIMEOUT
+let pickRoi = null;      // 冻结的打分区域 {x,y,n}，见 startPick()
+let prevGray = null;     // 上一帧的灰度块，用来算帧间运动量
+let zoomApplied = null;  // 实际生效的 zoom 倍数（不支持 zoom 约束则为 null）
+let last = null;   // 最近一次结果，用于画框
+let viewW = 0, viewH = 0;   // 取景区的 CSS 像素尺寸（画框坐标就用这个坐标系）
 
+/* ---------------- 布局：让取景区保持视频比例 ---------------- */
+function layout(){
+  const w = $('stage').clientWidth;
+  const ar = (v.videoWidth && v.videoHeight) ? v.videoHeight / v.videoWidth : 3/4;
+  const h = Math.min(Math.round(w * ar), Math.round(window.innerHeight * 0.62));
+  $('stage').style.height = h + 'px';
+  viewW = w; viewH = h;
+  // 画布按设备像素比放大，避免高分屏上线条发虚；再用 setTransform 把绘图
+  // 坐标系还原成 CSS 像素，这样下面所有映射都只跟 viewW/viewH 打交道。
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  ov.width = Math.round(w * dpr);
+  ov.height = Math.round(h * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (last) draw(last);
+}
+addEventListener('resize', layout);
+v.addEventListener('loadedmetadata', layout);
 
-app = FastAPI(title="cardpose-ws", lifespan=lifespan)
+/* ---------------- 自动挑视角最大的后置镜头 ----------------
 
+   Web 端【没有】任何 API 能表达"用系统相机默认那颗镜头、默认那个倍数"。
+   facingMode:'environment' 只保证是后置 —— 多摄手机上 Android Chrome 会把每颗
+   物理镜头都枚举成独立设备（主摄/超广角/长焦/景深），浏览器常按枚举顺序挑，
+   很容易给到超广角或景深镜头。iOS Safari 只暴露一个逻辑后置相机、内部自动切，
+   所以这基本是 Android 的问题。
 
-@app.get("/health")
-def health():
-    return JSONResponse({
-        "ok": card_det is not None,
-        "card_providers": card_det.providers if card_det else [],
-        "card_imgsz": card_det.imgsz if card_det else None,
-        "face_backend": face_det.backend if face_det else None,
-        "gpu": bool(card_det and "CUDAExecutionProvider" in card_det.providers),
-        "active": len(ACTIVE),
-        "capacity": MAX_USERS,
-    })
+   目标是【视角最大】的那颗（证件能离手机更近还装得下，取景更容易）。
+   Web API 没有 fieldOfView 这个能力项，所以用 zoom 下限当代理指标 ——
+   能缩到越小倍数的，视角就越广。判据按可靠性排序：
+     1) zoom 下限越小越优先 —— 逻辑相机常是 0.5~10（能用到超广角），
+        独立枚举的物理超广角报自己的 1~4
+     2) zoom 跨度越大越优先 —— 跨度大通常意味着是逻辑相机，覆盖的镜头更多
+     3) 最大分辨率更高的优先（同等视角下画质更好）
+     4) label 索引升序，仅作稳定排序用
 
+   代价（已实测）：超广角有桶形畸变，而我们做的是【透视矫正】，
+   4 点透视变换在数学上无法纠正桶形畸变。实测角点误差随畸变增大：
+     无畸变 14.2px | 典型超广角(k1=-0.12) 18.0px | 强畸变(-0.20) 23.8px
+   检出率和判定（rot/skew/aspect）不受影响、不会误拒，只是角点精度下降约 1.3 倍。
 
-@app.get("/stats")
-def stats():
-    """运维/监控用：当前并发、容量、真实处理耗时分位。"""
-    ms = sorted(_recent_ms)
-    active = len(ACTIVE)
-    return JSONResponse({
-        "ok": card_det is not None,
-        "gpu": bool(card_det and "CUDAExecutionProvider" in card_det.providers),
-        "active": active,
-        "capacity": MAX_USERS,
-        "load": round(active / MAX_USERS, 3) if MAX_USERS else 1.0,
-        "accepting": card_det is not None and active < MAX_USERS,
-        # 真实处理耗时比连接数更能反映压力：连接数没满但 p95 已经很高，
-        # 说明 GPU 被别的负载抢了。
-        "ms_p50": round(ms[len(ms) // 2], 1) if ms else None,
-        "ms_p95": round(ms[int(len(ms) * 0.95)], 1) if ms else None,
-        "samples": len(ms),
-    })
+   ⚠ zoom 范围的语义各家 ROM 不完全一致，我没有多摄安卓机可验证。
+   探测结果会 console.log 出来（也可以用 window.__camProbe 取），
+   真机上如果挑错了，把那份打分数据发出来就能据实修正排序规则。
 
+   探测要逐个开关摄像头，慢且屏幕会闪，所以结果缓存起来只做一次。
+   用户手动选过镜头的话完全不走这条路径。 */
+const MAIN_CAM_KEY = 'cardpose.widestBackCam.v2';   // 改了判据，换 key 让旧缓存自然失效
 
-def _jpeg(img: np.ndarray) -> bytes:
-    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-    return buf.tobytes() if ok else b""
+async function pickWidestBackCamera(){
+  let devs = [];
+  try {
+    devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  } catch(e){ return ''; }
+  if (devs.length <= 1) return '';         // 只有一颗（iOS 就是这样），没得挑
 
+  const backs = devs.filter(d => /back|rear|环境|后/i.test(d.label));
+  const pool  = backs.length ? backs : devs;
+  if (pool.length <= 1) return pool.length ? pool[0].deviceId : '';
 
-def _b64(data: bytes) -> str:
-    return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+  const scored = [];
+  for (const d of pool){
+    let s = null;
+    try{
+      // 请求【小分辨率】——摄像头初始化明显更快，黑屏时间更短。
+      // getCapabilities() 返回的是设备能力上限，与本次请求的分辨率无关，
+      // 所以照样能比出各颗镜头的 zoom 范围和最大分辨率。
+      s = await navigator.mediaDevices.getUserMedia({
+        video: { deviceId:{exact:d.deviceId}, width:{ideal:320}, height:{ideal:240} }
+      });
+      const t = s.getVideoTracks()[0];
+      const st = t.getSettings ? (t.getSettings() || {}) : {};
+      const caps = (t.getCapabilities && t.getCapabilities()) || {};
+      const z = (caps.zoom && typeof caps.zoom.min === 'number') ? caps.zoom : null;
+      scored.push({
+        id: d.deviceId,
+        label: d.label || '(未命名)',
+        idx: parseInt((String(d.label).match(/(\d+)/) || [, '99'])[1], 10),
+        // 注意：这里依赖 caps.width.max（设备能力上限）。若浏览器不支持
+        // getCapabilities()，会回落到 st.width，而低分辨率探测下所有候选都是
+        // 320 → 分辨率判据失效。但那种浏览器同样拿不到 zoom，本来也无法判断
+        // 视角，整体会退化成"第一个后置"，和不做探测等价 —— 可接受。
+        pixels: ((caps.width && caps.width.max) || st.width || 0)
+              * ((caps.height && caps.height.max) || st.height || 0),
+        zoom: z ? { min: z.min, max: z.max } : null,
+        // zoom 下限当"视角能有多广"的代理指标；没有 zoom 能力的按 1 处理
+        zoomMin: z ? z.min : 1,
+        zoomSpan: z ? (z.max - z.min) : 0,
+      });
+    }catch(e){ /* 这颗打不开就跳过 */ }
+    finally { if (s) s.getTracks().forEach(t => t.stop()); }
+  }
+  if (!scored.length) return '';
 
+  scored.sort((a, b) => {
+    if (a.zoomMin !== b.zoomMin) return a.zoomMin - b.zoomMin;       // 能缩得更小=视角更广
+    if (b.zoomSpan !== a.zoomSpan) return b.zoomSpan - a.zoomSpan;   // 跨度大=逻辑相机
+    if (b.pixels !== a.pixels) return b.pixels - a.pixels;
+    return a.idx - b.idx;
+  });
+  window.__camProbe = scored;      // 真机排查用：控制台里直接看
+  console.log('[cam] 后置镜头探测打分（第一个是选中的，视角最大）', scored);
+  return scored[0].id;
+}
 
-# ------------------------------------------------------------------ 同步处理
-def process_card(bgr: np.ndarray, tracker: CardTracker) -> dict:
-    """流式帧：只出判定和画框坐标，不回图。
+/* 把 zoom 拉到能力下限 —— 这是拿到最大视角的关键一步。
+   光挑对设备不够：逻辑相机默认往往停在 1×（主摄等效），必须显式缩到 min
+   才会真正用上超广角。只有 Chrome Android 支持 zoom 约束，iOS Safari 不支持，
+   所以全程用可选调用保护，失败就沉默返回 null。 */
+async function applyWidestZoom(track){
+  try{
+    const caps = track.getCapabilities && track.getCapabilities();
+    if (!caps || !caps.zoom || typeof caps.zoom.min !== 'number') return null;
+    await track.applyConstraints({ advanced: [{ zoom: caps.zoom.min }] });
+    const got = (track.getSettings && track.getSettings().zoom);
+    return typeof got === 'number' ? got : caps.zoom.min;
+  }catch(e){}
+  return null;
+}
 
-    客户端推的是小图（约 7KB），只够做姿态判定和实时提示；
-    等它自己数到连续 N 帧合格，会另外上传一张高清帧走 process_capture。
-    """
-    r = tracker.step(bgr)          # 判定用原始角点、画框用平滑角点，见 CardTracker
-    payload = {
-        "mode": "card", "ok": r.ok, "reason": r.reason, "msg": r.msg,
-        "conf": round(r.conf, 3), "rotate_deg": r.rotate_deg, "skew": r.skew,
-        "area_ratio": r.area_ratio, "aspect": r.aspect, "quad": r.quad,
-        "raw_quad": r.raw_quad, "jitter": r.jitter, "held": r.held, "votes": r.votes,
+/* ---------------- 摄像头 ---------------- */
+async function openCam(){
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    showErr('这个浏览器上下文拿不到摄像头。<br>手机访问必须是 <b>HTTPS</b> 或 <code>localhost</code>。'
+      + '请用启动脚本给出的 <code>https://…</code> 地址打开本页，并信任自签证书。');
+    return false;
+  }
+  stop();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+
+  // 手动指定 > 缓存 > 交给 facingMode。
+  // 关键：这里【不做探测】，先立刻出画面，避免黑屏。探测放到出画面之后、
+  // 而且只在确实需要时才做（见下面的快路径判断）。
+  let useId = deviceId;
+  if (!useId && facing === 'environment'){
+    try { useId = localStorage.getItem(MAIN_CAM_KEY) || ''; } catch(e){}
+  }
+
+  const vid = useId
+    ? { deviceId:{exact:useId}, width:{ideal:1280}, height:{ideal:960}, resizeMode:'none' }
+    : { facingMode:{ideal:facing}, width:{ideal:1280}, height:{ideal:960} };
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({ video: vid, audio:false });
+  }catch(e){
+    // 指定的那颗打不开（换机后缓存失效、或被别的应用占用）就退回自动档，别卡死
+    if (!useId){
+      showErr('打开摄像头失败：<code>' + e.name + ' ' + e.message + '</code>'
+        + '<br>请检查浏览器是否已授予相机权限。');
+      return false;
     }
-    return payload
+    if (useId !== deviceId){ try { localStorage.removeItem(MAIN_CAM_KEY); } catch(e2){} }
+    deviceId = '';
+    try{
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode:{ideal:facing}, width:{ideal:1280}, height:{ideal:960} },
+        audio: false,
+      });
+    }catch(e3){
+      showErr('打开摄像头失败：<code>' + e3.name + ' ' + e3.message + '</code>'
+        + '<br>请检查浏览器是否已授予相机权限。');
+      return false;
+    }
+  }
+  v.srcObject = stream;
+  await v.play().catch(()=>{});
+  let track = stream.getVideoTracks()[0];
+  zoomApplied = await applyWidestZoom(track);
+  layout();
+  hideErr();
+  await listCams();
 
+  // ---- 只在必要时才探测，避免无谓的黑屏 ----
+  //
+  // 快路径：如果当前这颗本身就能缩到 zoom < 1，说明它已经是一个能用上超广角的
+  // 逻辑相机 —— 上面 applyWidestZoom 已经把它拉到最广了，不需要再探测别的镜头。
+  // 现代多摄手机大多走这条路，代价为零、无黑屏。
+  //
+  // 慢路径：只有当前这颗缩不下去（zoom.min >= 1 或压根不支持 zoom）时，才说明
+  // 广角可能在另一个设备上，这时才值得付黑屏的代价去探一次。结果会缓存。
+  if (!deviceId && facing === 'environment' && !useId){
+    const caps = (track.getCapabilities && track.getCapabilities()) || {};
+    const canGoWide = !!(caps.zoom && caps.zoom.min < 1);
+    const curId = (track.getSettings && track.getSettings().deviceId) || '';
 
-def process_capture(bgr: np.ndarray, mode: str) -> dict:
-    """高清抓拍帧：判定通过就裁图回传。
-
-    这里刻意用【无状态】的 judge()：它返回的是这一帧自己的原始角点，
-    不含任何时域平滑。平滑值混了前几帧位置，证件一移动就落后（实测覆盖率
-    94.5% vs 97%，缺的那 5% 就是"证件不全"），绝不能拿来裁图。
-    """
-    if mode == "face":
-        r = face_det.judge(bgr)
-        payload = {
-            "mode": "face", "capture": True, "ok": False,
-            "reason": r.reason, "msg": r.msg, "conf": r.conf, "box": r.box,
-            "landmarks": r.landmarks, "roll_deg": r.roll_deg,
-            "yaw_ratio": r.yaw_ratio, "area_ratio": r.area_ratio,
-            "count": r.count, "sharp": r.sharp,
+    if (canGoWide){
+      if (curId){ try { localStorage.setItem(MAIN_CAM_KEY, curId); } catch(e){} }
+    } else {
+      banner('正在查找更广的镜头…', 'wait');
+      const best = await pickWidestBackCamera();
+      if (best && best !== curId){
+        try { localStorage.setItem(MAIN_CAM_KEY, best); } catch(e){}
+        // 探测过程已经把流停掉了，用挑中的那颗重开
+        if (stream) stream.getTracks().forEach(t => t.stop());
+        try{
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { deviceId:{exact:best}, width:{ideal:1280}, height:{ideal:960},
+                     resizeMode:'none' },
+            audio: false,
+          });
+          v.srcObject = stream;
+          await v.play().catch(()=>{});
+          track = stream.getVideoTracks()[0];
+          zoomApplied = await applyWidestZoom(track);
+          layout();
+          await listCams();
+        }catch(e){
+          // 挑中的这颗反而打不开：清掉缓存，下次重新走一遍
+          try { localStorage.removeItem(MAIN_CAM_KEY); } catch(e2){}
+          return openCam();
         }
-        if not r.ok:
-            return payload
-        crop = face_det.crop(bgr, r.box)
-        payload.update(ok=True, final=True, image=_b64(_jpeg(crop)),
-                       image_size=[crop.shape[1], crop.shape[0]])
-        return payload
-
-    r = card_det.judge(bgr)
-    payload = {
-        "mode": "card", "capture": True, "ok": False,
-        "reason": r.reason, "msg": r.msg, "conf": round(r.conf, 3),
-        "rotate_deg": r.rotate_deg, "skew": r.skew, "aspect": r.aspect,
-        "area_ratio": r.area_ratio, "quad": r.quad,
+      } else if (curId){
+        // 探完发现当前这颗就是最广的，记下来省得下次再探
+        try { localStorage.setItem(MAIN_CAM_KEY, curId); } catch(e){}
+      }
+      banner('点击「开始」', 'wait');
     }
-    if not r.ok:
-        # 高清帧没通过就不闭锁，让客户端继续推流重试
-        return payload
-    card = CardPoseDetector.warp(bgr, r.quad)
+  }
+  return true;
+}
 
-    # 清晰度闸门。判的是【矫正后的裁图】，也就是真正交给下游 OCR 的那张图，
-    # 而不是原始上传帧 —— 背景清不清楚无所谓，证件本体清楚才有意义。
-    #
-    # 姿态判定完全测不出运动模糊（手一直抖但证件摆得端正，rot/skew/aspect 全过），
-    # 所以没有这道闸门的话，糊图会一路通过并 final 闭锁，用户以为成功了。
-    # 被这里拒掉【不闭锁】，客户端会继续推流重试，见 Conn.done。
-    sharp = tenengrad(card)
-    payload["sharp"] = round(sharp, 1)
-    lim = card_det.rule.min_sharpness
-    if lim > 0 and sharp < lim:
-        payload.update(reason="blurry", msg=CARD_TEXT["blurry"])
-        return payload
+/* 枚举摄像头。注意：只有拿到权限后 label 才有内容，所以要在 openCam 成功之后调用。 */
+async function listCams(){
+  const sel = $('camSel');
+  let ds = [];
+  try{
+    ds = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  }catch(e){ return; }
 
-    payload.update(ok=True, final=True, image=_b64(_jpeg(card)),
-                   image_size=[card.shape[1], card.shape[0]])
-    return payload
+  const cur = stream && stream.getVideoTracks()[0];
+  const curId = cur && cur.getSettings ? cur.getSettings().deviceId : '';
+  sel.innerHTML = '';
+  const auto = new Option('摄像头：自动（' + (facing === 'user' ? '前置' : '后置') + '）', '');
+  sel.appendChild(auto);
+  sel.appendChild(new Option('↻ 重新探测最广后置镜头', '__reprobe__'));
+  ds.forEach((d, i) => {
+    const o = new Option(d.label || ('摄像头 ' + (i + 1)), d.deviceId);
+    sel.appendChild(o);
+  });
+  sel.value = deviceId && ds.some(d => d.deviceId === deviceId) ? deviceId : '';
 
+  const st = cur && cur.getSettings ? cur.getSettings() : {};
+  $('sCam').textContent = (cur ? (cur.label || '未命名') : '-')
+    + (st.width ? '  ' + st.width + '×' + st.height : '')
+    + (zoomApplied ? '  zoom=' + zoomApplied + 'x' : '')
+    + (deviceId ? '  [手动]' : '  [自动挑最广]');
+  // 自动档时也把当前实际用的设备高亮出来，方便知道系统选了哪一个
+  if (!deviceId && curId){
+    const hit = [...sel.options].find(o => o.value === curId);
+    if (hit) hit.textContent = '▸ ' + hit.textContent;
+  }
+}
 
-def process_face(bgr: np.ndarray) -> dict:
-    """流式帧：只出判定，不回图（同 process_card）。"""
-    r = face_det.judge(bgr)
-    payload = {
-        "mode": "face", "ok": r.ok, "reason": r.reason, "msg": r.msg,
-        "conf": r.conf, "box": r.box, "landmarks": r.landmarks,
-        "roll_deg": r.roll_deg, "yaw_ratio": r.yaw_ratio,
-        "area_ratio": r.area_ratio, "count": r.count, "sharp": r.sharp,
+function showErr(html){ $('err').innerHTML = html; $('err').style.display = 'block'; }
+function hideErr(){ $('err').style.display = 'none'; }
+
+/* ---------------- WebSocket ---------------- */
+function connect(){
+  return new Promise(res => {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(proto + '://' + location.host + '/ws');
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {
+      $('dot').classList.add('on'); $('sWs').textContent = '已连接';
+      ws.send(JSON.stringify({type:'config', mode}));
+      // 保活：RunPod 等反向代理会掐掉空闲连接，停止推流时也要有心跳
+      clearInterval(pingTimer);
+      pingTimer = setInterval(() => {
+        if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'ping'}));
+      }, 20000);
+      res(true);
+    };
+    ws.onclose = (e) => {
+      lastCloseCode = e.code;          // 4429=并发已满
+      $('dot').classList.remove('on');
+      $('sWs').textContent = '已断开' + (e.code ? ' (' + e.code + ')' : '');
+      clearInterval(pingTimer); stop(); res(false);
+    };
+    ws.onerror = () => { $('sWs').textContent = '连接错误'; };
+    ws.onmessage = e => onMsg(JSON.parse(e.data));
+  });
+}
+
+function onMsg(m){
+  if (m.type === 'hello'){
+    $('sBk').textContent = (m.card_providers||[]).join(',').replace(/ExecutionProvider/g,'')
+                          + ' / ' + m.face_backend;
+    return;
+  }
+  if (m.type === 'config_ok'){ $('sMode').textContent = m.mode; return; }
+  if (m.type === 'record_started'){ banner('正在录制 ' + m.n + ' 帧…', 'wait'); return; }
+  if (m.type === 'error'){
+    got++;
+    resetPick();               // 这一帧判定没出来，候选窗口作废重新数
+    banner('服务端错误：' + m.msg, 'bad');
+    return;
+  }
+  if (m.type !== 'result') return;
+
+  got++;
+  last = m;
+  dropped += (m.dropped || 0);
+
+  $('sMs').textContent    = m.ms + ' ms';
+  $('sRtt').textContent = (lastSentAt ? (performance.now() - lastSentAt).toFixed(0) : '-') + ' ms';
+  $('sReason').textContent= m.reason;
+  $('sConf').textContent  = (m.conf ?? '-');
+  $('sSize').textContent  = (m.bytes_in/1024).toFixed(0) + ' KB @ '
+                          + m.frame_size[0] + '×' + m.frame_size[1];
+  $('sJit').textContent = m.mode === 'card'
+      ? (m.jitter != null ? m.jitter + ' px' : '-') + ' / ' + (m.votes || '-')
+        + (m.held ? '  (漏检沿用上帧)' : '')
+      : (m.sharp != null ? '清晰度 ' + m.sharp : '-');
+  if (m.rec_done) banner('录制完成：' + m.rec_done, 'ok');
+  $('sGeo').textContent = m.mode === 'card'
+      ? (m.rotate_deg ?? '-') + '° / ' + (m.skew ?? '-')
+      : 'roll ' + (m.roll_deg ?? '-') + '° / yaw ' + (m.yaw_ratio ?? '-');
+
+  // 数连续合格帧。第 1 个合格帧就开始本地打分攒候选，够数了直接出图。
+  okStreak = m.ok ? okStreak + 1 : 0;
+  if (!m.ok){
+    resetPick();                           // 证件动了/脱框了：候选作废，重新数
+  } else if (!finishing){
+    // finishing 之后一律不再处理：这一轮已经出图了。
+    // 少了这个判断会出【一个真实的 bug】—— 停止发送只是不再发新帧，已经在路上的
+    // 帧还会陆续回结果。每一条都会走到这里，看到 !picking 就 startPick()（bestScore
+    // 归 -1），紧接着 okStreak 仍 >= 3、pickBlocker 因为"没有候选"返回 null，
+    // 于是又出一次图，而且这次是 snapBest() 抓的【当前】画面、没过任何闸门。
+    // 表现就是证件早已移开，几百毫秒后又冒出一张"已采集"。
+    if (!picking) startPick();
+    // 攒够合格帧【且】手上这张够干净才出图；不够就把窗口顺延，继续攒。
+    // 用户手稳时这两个闸门一次就过，行为和不设闸门时完全一样、不多等一帧。
+    if (okStreak >= captureAfter()){
+      // 一个候选都还没攒到就先同步打一帧的分（约 5ms），别让闸门空判 ——
+      // bestScore<0 时 pickBlocker 会直接放行，等于把一张没检验过的帧交出去。
+      if (bestScore < 0) pickStep();
+      const why = pickBlocker();
+      const late = performance.now() - pickStart > PICK_TIMEOUT;
+      if (!why || late){
+        if (why) console.log('[pick] 超时降级出图，被拦原因:', why,
+                             'motion=' + bestMotion.toFixed(2),
+                             'sharp=' + bestScore.toFixed(0) + '/' + maxSharp.toFixed(0));
+        finishing = true;
+        picking = false; stopScoring();
+        finishPick();
+      }
     }
-    return payload
+  }
+  $('sStreak').textContent = okStreak + '/' + captureAfter()
+      + (picking ? '  候选 ' + picked : '');
 
+  // 标 MOTION_MAX / SHARP_REL 就看这一行：手稳时"动"应该在 0.3~0.8（接近噪声底噪），
+  // 故意晃一晃看它涨到多少，阈值取两者中间。锐度那两个数是"最佳候选 / 会话最高"。
+  $('sLocal').textContent = bestScore < 0 ? '-'
+      : bestScore.toFixed(0) + ' / ' + maxSharp.toFixed(0)
+        + '   动 ' + curMotion.toFixed(2) + '（选中帧 ' + bestMotion.toFixed(2) + '）';
 
-# ------------------------------------------------------------------ WebSocket
-class Conn:
-    """每个连接一个：最新帧覆盖旧帧（latest-wins），避免推理跟不上时排队堆积。"""
+  // 打分耗时。24fps 的周期是 41.7ms，均值超过 10ms 就说明这块开销明显了
+  // （它跑在主线程上，会和推流的 JPEG 编码抢时间）—— 那就把 SHARP_PATCH 调小。
+  $('sScoreMs').textContent = scoreMs
+      ? scoreMs.toFixed(1) + ' / ' + scoreMsMax.toFixed(1) + ' ms'
+        + '   占 ' + (scoreMs * SCORE_FPS / 10).toFixed(0) + '%'
+      : '-';
 
-    def __init__(self, ws: WebSocket):
-        self.ws = ws
-        self.mode = "card"
-        self.pending: bytes | None = None
-        self.event = asyncio.Event()
-        self.closed = False
-        self.seq = 0
-        self.dropped = 0
-        self.tracker = CardTracker(card_det)   # 时域平滑是有状态的，必须每连接一份
-        self.rec_left = 0                      # 还要录几帧
-        self.rec_dir: str | None = None
-        self.done = False                      # 已抓到合格结果，闭锁；收 reset 才解开
-        self.ignored = 0                       # 闭锁后忽略掉的帧数
-        self.expect_capture = False            # 下一个二进制帧是高清抓拍帧
-        self.capture: bytes | None = None      # 高清帧单独存，绝不被流式帧覆盖
+  // 被闸门拦下时要说清楚是"抖"还是"没对上焦"，否则用户看到一直提示
+  // "证件已对准"却不出结果，只会以为程序卡了。
+  const why = (picking && okStreak >= captureAfter()) ? pickBlocker() : null;
+  if (why === 'shake'){
+    banner('手机抖动太大，请双手持稳或把手机靠在桌面上', 'bad');
+  } else if (why === 'blur'){
+    banner('画面还不够清晰，等一下对焦…', 'wait');
+  } else {
+    banner(m.msg + (okStreak ? '  ' + okStreak + '/' + captureAfter() : ''),
+           m.ok ? 'ok' : (m.reason === 'unstable' ? 'wait' : 'bad'));
+  }
 
-    def submit(self, data: bytes):
-        # 一次性抓拍：已经出过合格结果就彻底不再处理，也不回消息。
-        # 客户端理应收到 final 后就停发，这里是兜底（网络在途的帧、或客户端没停）。
-        if self.done:
-            self.ignored += 1
-            return
+  // 服务端只回判定，不再回图：m.image / m.final 这条路径客户端已经不用了
+  // （不发 capture 帧，服务端的 process_capture 和闭锁逻辑就永远不会被触发）。
+  draw(m);
+}
 
-        if self.expect_capture:
-            # 高清帧只传一次，必须保证被处理 —— 不参与 latest-wins 丢弃
-            self.expect_capture = False
-            self.capture = data
-            self.event.set()
-            return
+/* 采集完成。现在由【客户端】自己判定结束，不再等服务端的 final ——
+   服务端的作用只剩"这一帧摆正了没有"。 */
+function finish(){
+  stop();                                  // 停掉发送定时器（摄像头预览保留）
+  banner(mode === 'card' ? '✓ 证件已采集（本地出图）' : '✓ 人脸已采集（本地出图）', 'ok');
+  $('btnStart').style.display = 'none';
+  $('btnAgain').style.display = '';
+  $('sFps').textContent = fpsText() + '  已停止';
+}
 
-        if self.pending is not None:
-            self.dropped += 1          # 上一帧还没处理完，丢掉它（只丢流式帧）
-        self.pending = data
-        self.event.set()
+function banner(text, cls){ const b = $('banner'); b.textContent = text; b.className = cls; }
 
-    def unlock(self):
-        """重新开始一次抓拍。"""
-        self.done = False
-        self.ignored = 0
-        self.pending = None
-        self.capture = None
-        self.expect_capture = False
-        self.tracker.reset()
+/* ---------------- 叠加绘制 ---------------- */
+function draw(m){
+  ctx.clearRect(0,0,viewW,viewH);
+  // 关键：服务端返回的坐标属于"上传帧"坐标系（流式帧 STREAM_LONG、高清帧 CAP_LONG，
+  // 例如 960×720），不是 video.videoWidth（1280×960）。用 videoWidth 换算会让框
+  // 整体缩小并偏向左上角，所以这里必须用服务端回传的 frame_size。
+  const fw = m.frame_size && m.frame_size[0], fh = m.frame_size && m.frame_size[1];
+  if (!fw || !fh) return;
+  // video 是 object-fit:cover，按同样规则（等比放大到铺满 + 居中裁切）映射
+  const s = Math.max(viewW/fw, viewH/fh);
+  const ox = (viewW - fw*s)/2, oy = (viewH - fh*s)/2;
+  const P = (x,y) => [x*s+ox, y*s+oy];
 
-    async def worker(self):
-        loop = asyncio.get_running_loop()
-        while not self.closed:
-            await self.event.wait()
-            self.event.clear()
-            # 高清抓拍帧优先，且不会被丢
-            is_cap = self.capture is not None
-            if is_cap:
-                data, self.capture = self.capture, None
-            else:
-                data, self.pending = self.pending, None
-            if data is None:
-                continue
+  ctx.lineWidth = 3; ctx.strokeStyle = m.ok ? '#3fb950' : '#ffa657';
 
-            self.seq += 1
-            seq, dropped = self.seq, self.dropped
-            self.dropped = 0
-            mode = self.mode
-            t0 = time.perf_counter()
-            try:
-                bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-                if bgr is None:
-                    raise ValueError("JPEG decode failed")
-                if is_cap:
-                    payload = await loop.run_in_executor(
-                        None, process_capture, bgr, mode)
-                elif mode == "face":
-                    payload = await loop.run_in_executor(None, process_face, bgr)
-                else:
-                    payload = await loop.run_in_executor(
-                        None, process_card, bgr, self.tracker)
-                payload.update(type="result", seq=seq, dropped=dropped,
-                               ms=round((time.perf_counter() - t0) * 1000, 1),
-                               frame_size=[bgr.shape[1], bgr.shape[0]],
-                               bytes_in=len(data))
-                _recent_ms.append(payload["ms"])
-                del _recent_ms[:-200]          # 只留最近 200 个样本
-                # 一次性抓拍：这一帧合格且带回了图，就闭锁，后续帧不再处理
-                if payload.get("ok") and payload.get("image"):
-                    self.done = True
-                    self.pending = None
-                    payload["final"] = True
-                    print(f"[done] mode={mode} seq={seq} 已抓到合格结果，停止处理直到 reset")
-            except Exception as e:                                   # noqa: BLE001
-                payload = {"type": "error", "mode": mode, "seq": seq, "msg": str(e)}
+  if (m.mode === 'card' && m.quad && m.quad.length === 4){
+    ctx.beginPath();
+    m.quad.forEach((p,i)=>{ const [x,y]=P(p[0],p[1]); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+    ctx.closePath(); ctx.stroke();
+    ctx.fillStyle = ctx.strokeStyle;
+    m.quad.forEach((p,i)=>{ const [x,y]=P(p[0],p[1]);
+      ctx.beginPath(); ctx.arc(x,y,5,0,7); ctx.fill();
+      ctx.font='bold 13px monospace'; ctx.fillText(['TL','TR','BR','BL'][i], x+8, y-8); });
+  }
+  if (m.mode === 'face' && m.box && m.box.length === 4){
+    const [x,y,w,h] = m.box, [px,py] = P(x,y), [qx,qy] = P(x+w,y+h);
+    ctx.strokeRect(px,py,qx-px,qy-py);
+    ctx.fillStyle = ctx.strokeStyle;
+    (m.landmarks||[]).forEach(p=>{ const [a,b]=P(p[0],p[1]);
+      ctx.beginPath(); ctx.arc(a,b,3,0,7); ctx.fill(); });
+  }
+}
 
-            if self.rec_left > 0 and self.rec_dir:
-                try:
-                    self._dump(data, payload, seq)
-                except Exception as e:                               # noqa: BLE001
-                    print("[rec] 写盘失败:", e)
-                self.rec_left -= 1
-                if self.rec_left == 0:
-                    payload["rec_done"] = self.rec_dir
+/* ---------------- 采集 ---------------- */
+function grabAt(longSide, q){
+  const vw = v.videoWidth, vh = v.videoHeight;
+  if (!vw) return null;
+  const s = longSide / Math.max(vw,vh);
+  cap.width  = Math.round(vw*s);
+  cap.height = Math.round(vh*s);
+  cctx.drawImage(v, 0, 0, cap.width, cap.height);
+  return new Promise(r => cap.toBlob(r, 'image/jpeg', q));
+}
+function grab(){ return grabAt(STREAM_LONG, STREAM_Q); }
 
-            try:
-                await self.ws.send_text(json.dumps(payload, ensure_ascii=False))
-            except Exception:                                        # noqa: BLE001
-                self.closed = True
-                return
+/* ---------------- 选帧：Tenengrad 清晰度 ----------------
 
-    def _dump(self, data: bytes, payload: dict, seq: int):
-        """把原始上传帧和判定结果落盘，用于拿真机数据离线复现问题。"""
-        with open(os.path.join(self.rec_dir, f"{seq:05d}.jpg"), "wb") as f:
-            f.write(data)
-        meta = {k: v for k, v in payload.items() if k != "image"}   # 图别写进 jsonl
-        with open(os.path.join(self.rec_dir, "results.jsonl"), "a", encoding="utf-8") as f:
-            f.write(json.dumps(meta, ensure_ascii=False) + "\n")
+   Tenengrad = Sobel 梯度平方的均值。散焦和运动模糊都会把边缘抹平，
+   梯度随之变小，所以分数越高越清晰。相比拉普拉斯方差，它对噪点没那么敏感
+   （服务端人脸那道 blurry 闸门用的是拉普拉斯，那边是绝对阈值、需要另一种标定；
+   这里只在同一场景的几帧之间【比大小】，不需要绝对阈值，也就不必两边一致）。 */
 
+/* 算打分区域：目标中心的一块原尺寸像素。
+   证件用四角中心，人脸用检测框中心；都是上传帧（416 长边）坐标系，
+   按比例映射回视频原始像素。没有结果就退化成画面中心。 */
+function computeRoi(){
+  const vw = v.videoWidth, vh = v.videoHeight;
+  if (!vw) return null;
 
-@app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket):
-    # 先判容量再 accept —— 超限的连接不该占用任何资源
-    if len(ACTIVE) >= MAX_USERS:
-        await ws.close(code=4429)                      # 自定义：并发已满
-        return
+  let cx = vw / 2, cy = vh / 2;
+  const fs = last && last.frame_size;
+  if (fs && fs[0]){
+    const sx = vw / fs[0], sy = vh / fs[1];
+    const q = last.quad, b = last.box;
+    if (q && q.length === 4){
+      cx = (q[0][0] + q[1][0] + q[2][0] + q[3][0]) / 4 * sx;
+      cy = (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4 * sy;
+    } else if (b && b.length === 4){
+      cx = (b[0] + b[2] / 2) * sx;
+      cy = (b[1] + b[3] / 2) * sy;
+    }
+  }
+  const n = Math.min(SHARP_PATCH, vw, vh);
+  return {
+    x: Math.max(0, Math.min(vw - n, Math.round(cx - n / 2))),
+    y: Math.max(0, Math.min(vh - n, Math.round(cy - n / 2))),
+    n,
+  };
+}
 
-    await ws.accept()
-    conn = Conn(ws)
-    ACTIVE.add(conn)
-    task = asyncio.create_task(conn.worker())
-    await _send(ws, {
-        "type": "hello", "mode": conn.mode,
-        "card_providers": card_det.providers, "imgsz": card_det.imgsz,
-        "face_backend": face_det.backend,
-        "active": len(ACTIVE), "capacity": MAX_USERS,
-    })
+/* 给当前帧打分：返回 {sharp, motion}。
+   区域用 startPick() 冻结下来的那个，【整轮选帧不变】—— 否则 last 每来一条
+   结果就把区域挪一下，帧间差里混进"区域自己跳了"的位移，运动量就没法读了。 */
+function scoreFrame(){
+  const roi = pickRoi;
+  if (!roi) return { sharp: 0, motion: 0 };
+  const n = roi.n;
 
-    try:
-        while True:
-            msg = await ws.receive()
-            if msg["type"] == "websocket.disconnect":
-                break
-            if msg.get("bytes") is not None:
-                conn.submit(msg["bytes"])
-            elif msg.get("text"):
-                try:
-                    cmd = json.loads(msg["text"])
-                except json.JSONDecodeError:
-                    continue
-                if cmd.get("type") == "config":
-                    m = cmd.get("mode")
-                    if m in ("card", "face") and m != conn.mode:
-                        conn.mode = m
-                        conn.unlock()          # 换模式相当于重新开一次抓拍
-                        await _send(ws, {"type": "config_ok", "mode": m})
-                elif cmd.get("type") == "capture":
-                    # 紧跟其后的那个二进制帧按高清抓拍处理
-                    conn.expect_capture = True
-                elif cmd.get("type") == "record":
-                    n = max(1, min(int(cmd.get("n", 60)), 600))
-                    d = os.path.join(DUMP_ROOT, datetime.now().strftime("%Y%m%d_%H%M%S"))
-                    os.makedirs(d, exist_ok=True)
-                    conn.rec_dir, conn.rec_left = d, n
-                    print(f"[rec] 开始录制 {n} 帧 -> {d}")
-                    await _send(ws, {"type": "record_started", "n": n, "dir": d})
-                elif cmd.get("type") == "reset":
-                    ign = conn.ignored
-                    conn.unlock()              # 解开闭锁，可以重新抓一次
-                    await _send(ws, {"type": "reset_ok", "ignored": ign})
-                elif cmd.get("type") == "ping":
-                    await _send(ws, {"type": "pong"})
-    except WebSocketDisconnect:
-        pass
-    finally:
-        ACTIVE.discard(conn)
-        conn.closed = True
-        conn.event.set()
-        task.cancel()
+  shC.width = n; shC.height = n;
+  shctx.drawImage(v, roi.x, roi.y, n, n, 0, 0, n, n);   // 1:1，不缩放
+  const d = shctx.getImageData(0, 0, n, n).data;
 
+  // 先转灰度：整型权重 (77,150,29)/256 ≈ BT.601，比浮点快。
+  // 帧间绝对差顺手在这一趟里累加，省一次遍历。
+  const g = new Uint8Array(n * n);
+  const canDiff = prevGray && prevGray.length === g.length;
+  let diff = 0;
+  for (let i = 0, p = 0; i < g.length; i++, p += 4){
+    const y = (d[p] * 77 + d[p+1] * 150 + d[p+2] * 29) >> 8;
+    g[i] = y;
+    if (canDiff) diff += Math.abs(y - prevGray[i]);
+  }
 
-# ------------------------------------------------------------------ 静态页面
-@app.get("/")
-def index():
-    return FileResponse(os.path.join(WEB_DIR, "index.html"))
+  // Tenengrad（梯度平方均值）和梯度强度（|gx|+|gy| 均值）一趟算完，
+  // 后者是下面估位移的分母。
+  let sum = 0, gradAbs = 0;
+  for (let yy = 1; yy < n - 1; yy++){
+    const r0 = (yy-1)*n, r1 = yy*n, r2 = (yy+1)*n;
+    for (let xx = 1; xx < n - 1; xx++){
+      const gx = -g[r0+xx-1] - 2*g[r1+xx-1] - g[r2+xx-1]
+               +  g[r0+xx+1] + 2*g[r1+xx+1] + g[r2+xx+1];
+      const gy = -g[r0+xx-1] - 2*g[r0+xx] - g[r0+xx+1]
+               +  g[r2+xx-1] + 2*g[r2+xx] + g[r2+xx+1];
+      sum += gx*gx + gy*gy;
+      gradAbs += Math.abs(gx) + Math.abs(gy);
+    }
+  }
+  const inner = (n-2) * (n-2);
+  const sharp = sum / inner;
 
+  // 帧间运动量 ≈ 【两帧之间移动了几个像素】。
+  //
+  // 依据：位移 δ 造成的强度变化 |ΔI| ≈ |∇I|·δ，所以 mean|ΔI| / mean|∇I| ≈ δ。
+  // Sobel 核对线性斜坡有 8 倍增益，乘回来，读数就直接是像素。
+  //
+  // 关键是【除以梯度强度而不是除以标准差】。除标准差看着也像归一化，实测却是错的：
+  // 分子里的传感器噪声不随对比度变小，一除就被放大 —— 低对比度画面轻轻一动
+  // 读数就飙到高对比度剧烈晃动的 3 倍，完全反了。除梯度强度则分子分母同步缩放。
+  //
+  // 合成图实测（480×480，σ=2 噪声）：
+  //   静止 0.29（这就是噪声底噪） | 1px 0.83 | 3px 1.82 | 6px 3.05
+  //   低对比度 3px 1.73 vs 高对比度 3px 1.82  -> 确认与对比度无关
+  //   已散焦 + 1px 0.68 vs 清晰 + 1px 0.83   -> 散焦不会把读数抬高
+  let motion = 0;
+  if (canDiff) motion = 8 * (diff / g.length) / Math.max(gradAbs / inner, 1);
+  prevGray = g;
+  return { sharp, motion };
+}
 
-app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+/* 把当前帧按高清尺寸存进 bestC，作为目前的最佳候选。
+   记下时刻 —— 上传的是这张【存下来的旧帧】，多旧必须能查，见 BEST_MAX_AGE。 */
+function snapBest(){
+  const vw = v.videoWidth, vh = v.videoHeight;
+  const s = CAP_LONG / Math.max(vw, vh);
+  bestC.width  = Math.round(vw * s);
+  bestC.height = Math.round(vh * s);
+  bctx.drawImage(v, 0, 0, bestC.width, bestC.height);
+  bestAt = performance.now();
+}
 
+/* 评估一帧，比目前最好的还清晰就替换掉。
+   必须【同步】跑完评分和存帧，中间不能 await —— 否则视频已经翻到下一帧，
+   存下来的就不是打分的那一帧了。
+   什么时候停由 onMsg 决定（攒够合格帧且够清晰才发），这里不管。 */
+function pickStep(){
+  const now = performance.now();
+  // 候选过期就作废，让当前帧重新当最佳 —— 只在最近 BEST_MAX_AGE 内的帧里挑。
+  if (bestScore >= 0 && now - bestAt > BEST_MAX_AGE) bestScore = -1;
 
-if __name__ == "__main__":
-    import uvicorn
+  // 打分耗时实测。桌面 V8 上纯计算 1.69ms/帧（480×480），但真机还要算上
+  // getImageData 的 GPU 回读（921KB），那部分只能在设备上量 —— 所以这里直接量。
+  const t0 = performance.now();
+  const { sharp, motion } = scoreFrame();
+  const dt = performance.now() - t0;
+  scoreMs = scoreMs ? scoreMs * 0.9 + dt * 0.1 : dt;    // EMA，看稳态
+  if (dt > scoreMsMax) scoreMsMax = dt;                 // 峰值，看有没有偶发卡顿
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--certfile", default=None)
-    ap.add_argument("--keyfile", default=None)
-    a = ap.parse_args()
+  picked++;
+  curMotion = motion;
+  if (sharp > maxSharp) maxSharp = sharp;
+  // 记下最佳候选【自己那一帧】的运动量：闸门要判的是选出来这张糊不糊，
+  // 不是"现在手稳不稳"。
+  if (sharp > bestScore){ bestScore = sharp; bestMotion = motion; snapBest(); }
+}
 
-    kw = {}
-    if a.certfile and a.keyfile:
-        kw["ssl_certfile"] = a.certfile
-        kw["ssl_keyfile"] = a.keyfile
-    uvicorn.run(app, host=a.host, port=a.port, ws_max_size=8 * 1024 * 1024, **kw)
+/* 现在能不能拍？返回拦下来的原因，null = 可以拍。
+   第一帧（prevGray 还没建立）运动量恒为 0，会被当成"很稳"，但那一帧同时也是
+   唯一的候选，拦它没有意义 —— 真在抖的话紧随其后的帧会把 bestMotion 顶上去。 */
+function pickBlocker(){
+  if (bestScore < 0) return null;                              // 一张候选都没有，别拦
+  if (bestMotion > MOTION_MAX) return 'shake';
+  if (maxSharp > 0 && bestScore < SHARP_REL * maxSharp) return 'blur';
+  return null;
+}
+
+/* 本地打分循环，和推流的 setInterval(tick) 各跑各的。
+   跑得比推流快是有意义的：候选越密，越可能逮到手抖间隙里那张清楚的。 */
+let scoreVfc = 0, scoreTimer = null;
+function startScoring(){
+  stopScoring();
+  const period = 1000 / SCORE_FPS;
+  if (typeof v.requestVideoFrameCallback === 'function'){
+    // rVFC 按摄像头帧率回调（常见 30fps，也可能 60），这里再限一道流：
+    // 只有距上次打分够久了才算，其余回调空转。所以实际频率 = min(摄像头, SCORE_FPS)。
+    // nextAt 从"上次应到的时刻"往后推、不追赶漂移，避免掉帧后连续补算。
+    let nextAt = 0;
+    const step = () => {
+      scoreVfc = 0;
+      if (!picking) return;              // 已经出图或作废了，自然结束
+      const now = performance.now();
+      if (now >= nextAt){
+        pickStep();
+        nextAt = Math.max(now, nextAt) + period;
+      }
+      scoreVfc = v.requestVideoFrameCallback(step);
+    };
+    scoreVfc = v.requestVideoFrameCallback(step);
+  } else {
+    scoreTimer = setInterval(() => { if (picking) pickStep(); }, period);
+  }
+}
+function stopScoring(){
+  if (scoreVfc && v.cancelVideoFrameCallback) v.cancelVideoFrameCallback(scoreVfc);
+  scoreVfc = 0;
+  if (scoreTimer){ clearInterval(scoreTimer); scoreTimer = null; }
+}
+
+function startPick(){
+  picking = true; picked = 0; bestScore = -1; bestMotion = 0;
+  pickStart = performance.now();
+  pickRoi = computeRoi();     // 整轮冻结，见 scoreFrame()
+  prevGray = null;            // 换了区域，上一帧的块不能再拿来做差
+  startScoring();
+}
+function resetPick(){
+  picking = false; picked = 0; bestScore = -1; bestMotion = 0;
+  pickRoi = null; prevGray = null;
+  stopScoring();
+}
+
+/* 攒够合格帧后出图。【全程本地】：不上传，只把窗口里最清晰的那一帧编码出来展示。
+   服务端的角色只剩"这一帧摆正了没有"，最终这张图不再过网络。 */
+async function finishPick(){
+  const age = performance.now() - bestAt;
+  // 兜底断言，两种都不该发生（调用方已经保证有候选、pickStep 会清过期的）。
+  // 宁可这一轮不出图、重新攒，也不要拿一张没检验过或明显过期的帧交差。
+  if (bestScore < 0 || age > BEST_MAX_AGE){
+    console.warn('[pick] 放弃出图: bestScore=' + bestScore.toFixed(0)
+               + ' 帧龄=' + age.toFixed(0) + 'ms');
+    finishing = false;
+    resetPick();
+    return;
+  }
+  // 出图帧龄 = 这张图是多久以前拍的。排查"移开后才成功"就看这个数。
+  console.log('[pick] 出图: 帧龄=' + age.toFixed(0) + 'ms'
+            + ' 选帧耗时=' + (performance.now() - pickStart).toFixed(0) + 'ms'
+            + ' 候选=' + picked
+            + ' motion=' + bestMotion.toFixed(2)
+            + ' sharp=' + bestScore.toFixed(0) + '/' + maxSharp.toFixed(0));
+  lastAge = age;
+
+  // 体积上限：证件细纹/防伪底纹很多，同样质量下比普通照片大不少
+  // （真机实测 q92 到过 177KB；细节极端的图 q82 还能到 240KB，
+  //  所以只降一档不够，要循环降到上限以下）。
+  // 现在这张图不过网络，压体积纯粹是为了给下游（保存/后续上传）一个可控的尺寸。
+  // 只降质量不降分辨率：分辨率直接决定证件细节，代价更大。
+  let blob = null;
+  for (let q = CAP_Q; q >= 0.5; q -= 0.12){
+    blob = await new Promise(r => bestC.toBlob(r, 'image/jpeg', q));
+    if (!blob || blob.size / 1024 <= CAP_MAX_KB) break;
+  }
+  if (!blob) return;
+
+  // 成果 blob 挂到 window 上：真机排查时能直接在控制台拿到它，
+  // 以后要落地"保存"或"提交给业务后端"也是从这里取，不用再走一遍选帧。
+  window.__lastShot = blob;
+  showResult(blob);
+  finish();
+}
+
+/* 展示选中的那一帧。这是【本地原始高清帧】，不是服务端矫正后的裁图 ——
+   要判断"选帧选对没有、清不清晰"，看的就得是这张原图。 */
+let shotUrl = null;
+function showResult(blob){
+  if (shotUrl) URL.revokeObjectURL(shotUrl);   // 不回收的话每拍一次泄漏一张图
+  shotUrl = URL.createObjectURL(blob);
+  $('shot').src = shotUrl;
+  $('shot').style.display = 'block';
+  $('empty').style.display = 'none';
+  // 帧龄一起显示出来：如果你觉得"移开之后才成功"，这个数就是证据 ——
+  // 它是这张图拍摄到出图的间隔，正常应该在 BEST_MAX_AGE 以内。
+  $('shotSize').textContent = '（' + (blob.size/1024).toFixed(0) + ' KB，帧龄 '
+                            + lastAge.toFixed(0) + 'ms）';
+}
+
+async function tick(){
+  if (!ws || ws.readyState !== 1) return;
+
+  // 注意：本地选帧【不在这里】，它跑在自己的 startScoring() 循环上。
+  // 故意分开的 —— 打分是纯本地计算不占上行，上行堵住时下面会 return 掉，
+  // 但打分不该跟着停，否则网络一差就攒不到候选、只能退回"抓当前帧"。
+
+  // 连续发送，不等上一帧的结果。
+  //
+  // 之前这里是"一帧一答"（收到结果才发下一帧），等于把发送速率锁死成 1/RTT ——
+  // 实测往返 377ms，上限就只有 2.65fps，连 3fps 都跑不满，而服务端单帧只要 32ms。
+  // 服务端本身是 latest-wins（新帧覆盖没来得及处理的旧帧，见 Conn.submit），
+  // 所以多发不会在服务端排队堆积。
+  //
+  // 但不能无脑发：网络一差就会往浏览器的 WS 发送缓冲里无限堆积，越堆越延迟。
+  // 正确的背压信号是 bufferedAmount（还没发出去的字节数），它反映的是
+  // 【上行是否堵住】，跟 RTT 无关 —— 这才是我们真正要限制的东西。
+  if (ws.bufferedAmount > MAX_BUFFERED){
+    dropped++;
+    $('sFps').textContent = fpsText();
+    return;
+  }
+
+  const blob = await grab();
+  if (!blob) return;
+
+  ws.send(await blob.arrayBuffer());
+  sent++; lastSentAt = performance.now();
+  $('sFps').textContent = fpsText();
+}
+
+let t0 = 0;
+function fpsText(){
+  const dt = (performance.now() - t0)/1000;
+  // 发送速率和回传速率分开看：一帧一答时两者被 RTT 锁在一起，
+  // 连续发送后发送速率应该稳定贴住 FPS，不再受 RTT 影响。
+  // 这里统计的只是【推流】，本地 24fps 的打分不走网络、不计入。
+  return (sent/Math.max(dt,.001)).toFixed(1) + ' / 回 '
+       + (got/Math.max(dt,.001)).toFixed(1) + ' fps / 丢 ' + dropped
+       + (ws && ws.bufferedAmount > 0 ? '  缓冲' + (ws.bufferedAmount/1024).toFixed(0) + 'KB' : '');
+}
+
+/* ---------------- 控制 ---------------- */
+async function start(){
+  if (!stream && !(await openCam())) return;
+  if (!ws || ws.readyState > 1){
+    if (!(await connect())){
+      banner(lastCloseCode === 4429 ? '服务当前连接数已满，请稍后重试' : '连接失败，请重试', 'bad');
+      return;
+    }
+  }
+  sent = 0; got = 0; dropped = 0; okStreak = 0; finishing = false; resetPick();
+  maxSharp = 0; curMotion = 0;      // SHARP_REL 的基准按会话重新学
+  scoreMs = 0; scoreMsMax = 0;      // 耗时统计也按会话重新算
+  t0 = performance.now();
+  clearInterval(timer);
+  timer = setInterval(tick, 1000 / FPS);
+}
+function stop(){
+  clearInterval(timer); timer = null;
+  resetPick();                      // 本地打分循环也一起停
+}
+
+$('btnStart').onclick = start;
+$('btnStop').onclick  = () => { stop(); banner('已停止', 'wait'); };
+
+// 重新识别。reset 现在只是保险：不发高清帧，服务端就永远不会闭锁，
+// 这条命令实际是空操作 —— 但留着，万一以后重新启用上传就不用再补。
+$('btnAgain').onclick = () => {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'reset'}));
+  $('btnAgain').style.display = 'none';
+  $('btnStart').style.display = '';
+  $('shot').style.display = 'none'; $('empty').style.display = 'block';
+  $('shotSize').textContent = '';
+  last = null; okStreak = 0; finishing = false; resetPick();
+  ctx.clearRect(0,0,viewW,viewH);
+  start();
+};
+$('btnCam').onclick   = async () => {
+  facing = facing === 'environment' ? 'user' : 'environment';
+  deviceId = '';                      // 回到自动档，交给浏览器按前/后置挑
+  const run = !!timer; stop();
+  if (await openCam() && run) start();
+};
+
+// 录制真机帧：出问题时点一下，服务端会把原始上传帧+判定结果存到 dumps/，
+// 之后可以用 tools/analyze_dump.py 离线复现，不用靠猜。
+$('btnRec').onclick = () => {
+  if (!ws || ws.readyState !== 1){ banner('请先点「开始」建立连接', 'bad'); return; }
+  ws.send(JSON.stringify({type:'record', n:50}));
+};
+
+// 手动选摄像头（很多手机后置有主摄/广角/长焦多颗，自动档不一定挑到清晰的那颗）
+$('camSel').onchange = async () => {
+  if ($('camSel').value === '__reprobe__'){
+    try { localStorage.removeItem(MAIN_CAM_KEY); } catch(e){}
+    deviceId = ''; facing = 'environment';
+    const run = !!timer; stop();
+    if (await openCam() && run) start();
+    return;
+  }
+  deviceId = $('camSel').value;
+  const run = !!timer; stop();
+  if (await openCam() && run) start();
+};
+
+function setMode(m){
+  mode = m;
+  $('tabCard').classList.toggle('act', m==='card');
+  $('tabFace').classList.toggle('act', m==='face');
+  $('sMode').textContent = m;
+  $('shot').style.display='none'; $('empty').style.display='block';
+  $('shotSize').textContent = '';
+  $('btnAgain').style.display='none'; $('btnStart').style.display='';   // 换模式=重开一次抓拍
+  last = null; okStreak = 0; finishing = false; resetPick();
+  ctx.clearRect(0,0,viewW,viewH);
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'config', mode:m}));
+  // 证件用后置、人脸用前置，更符合实际使用。
+  // 但如果用户已经手动指定了摄像头，就尊重用户的选择，不再自动切。
+  const want = m === 'card' ? 'environment' : 'user';
+  if (!deviceId && want !== facing){
+    facing = want; const run = !!timer; stop();
+    openCam().then(o => { if (o && run) start(); });
+  }
+}
+$('tabCard').onclick = () => setMode('card');
+$('tabFace').onclick = () => setMode('face');
+
+// 页面切到后台时（切 App / 锁屏），浏览器会把 setInterval 限流到 1 秒一次，
+// 摄像头帧也会停。这时干脆停掉推流，回到前台再恢复，省流量也免得出现假卡顿。
+let wasRunning = false;
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden){
+    wasRunning = !!timer;
+    if (wasRunning){ stop(); banner('已暂停（页面在后台）', 'wait'); }
+  } else if (wasRunning){
+    wasRunning = false;
+    start();
+  }
+});
+
+layout();
+if (!window.isSecureContext && location.hostname !== 'localhost'){
+  showErr('当前是非安全上下文（<code>' + location.protocol + '</code>），手机浏览器会禁止访问摄像头。'
+        + '<br>请改用 <code>https://…</code> 地址打开。');
+}
+</script>
+</body>
+</html>
