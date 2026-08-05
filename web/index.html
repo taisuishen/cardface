@@ -126,6 +126,23 @@ const CAP_MAX_KB  = 90;           // 高清帧体积上限，超了自动降质�
 const CAPTURE_AFTER_BY_MODE = { card: 3, face: 1 };
 function captureAfter(){ return CAPTURE_AFTER_BY_MODE[mode] || 1; }
 
+// 凑够连续合格帧后【不立刻拍】，而是再看 PICK_FRAMES 帧，本地算清晰度，
+// 挑最清晰的那一帧上传。
+//
+// 为什么要挑：姿态合格 ≠ 这一帧清晰。手持时手机一直在微动，10fps 下相邻帧的
+// 清晰度能差出好几倍（对焦呼吸、快门期间的位移）。服务端只对上传的那一张做
+// 判定，抓到糊的那张就直接影响 OCR，而且它自己看不出"下一帧其实更清楚"。
+// 代价：多等 PICK_FRAMES 帧。10fps 下 5 帧 = 500ms，推流不停，用户无感。
+const PICK_FRAMES_BY_MODE = { card: 5, face: 3 };
+function pickFrames(){ return PICK_FRAMES_BY_MODE[mode] || 3; }
+
+// 清晰度用 Tenengrad（Sobel 梯度平方均值）：越清晰边缘越陡，梯度越大。
+// 只在【原始像素】的一小块上算，不缩放 —— 缩放本身就是低通滤波，会把
+// "糊"和"清楚"的差别一起抹掉，正好毁掉我们要测的东西。
+// 取证件中心 480×480 的原尺寸方块：成本固定（约 23 万像素，真机 2~5ms），
+// 各候选帧的块大小一致，分数可以直接比。
+const SHARP_PATCH = 480;
+
 // 背压：只看"还没发出去的字节数"，不看有没有收到结果。
 //
 // 阈值 = 最多容忍多少排队延迟。积压 B 字节、上行 U 字节/秒，新帧就要多等 B/U 秒。
@@ -137,12 +154,20 @@ const MAX_BUFFERED= 24 * 1024;
 const $ = id => document.getElementById(id);
 const v = $('v'), ov = $('ov'), ctx = ov.getContext('2d');
 const cap = document.createElement('canvas'), cctx = cap.getContext('2d');
+// 选帧用的两块离屏画布：best 存目前最清晰的那一帧（高清尺寸，最后编码上传），
+// sh 是算 Tenengrad 的原尺寸小块。都跟 cap 分开，免得互相覆盖。
+const bestC = document.createElement('canvas'), bctx = bestC.getContext('2d');
+const shC = document.createElement('canvas');
+const shctx = shC.getContext('2d', { willReadFrequently: true });
 
 let ws = null, stream = null, timer = null, pingTimer = null;
 let mode = 'card', facing = 'environment', deviceId = '';   // deviceId 为空 = 按 facing 自动选
 let sent = 0, got = 0, dropped = 0, lastSentAt = 0, capSentAt = 0, lastCloseCode = 0;
-let okStreak = 0;        // 连续合格帧数，达到 CAPTURE_AFTER 就补传高清帧
+let okStreak = 0;        // 连续合格帧数，达到 CAPTURE_AFTER 就进入选帧
 let capturing = false;   // 高清帧在途，期间暂停推流
+let picking = false;     // 正在选帧：继续推流，同时逐帧算清晰度
+let picked = 0;          // 已评估的候选帧数
+let bestScore = -1;      // 目前最高的 Tenengrad 分数（-1 = 还没有候选）
 let zoomApplied = null;  // 实际生效的 zoom 倍数（不支持 zoom 约束则为 null）
 let last = null;   // 最近一次结果，用于画框
 let viewW = 0, viewH = 0;   // 取景区的 CSS 像素尺寸（画框坐标就用这个坐标系）
@@ -471,21 +496,31 @@ function onMsg(m){
   if (m.capture){
     // 高清帧的回执
     capturing = false;
+    resetPick();
     if (!m.ok){
       okStreak = 0;                        // 高清帧没通过：清零重来，服务端也没闭锁
       banner('高清帧未通过（' + m.msg + '），继续对准…', 'bad');
     }
   } else {
-    // 流式帧：数连续合格帧，够了就补传高清帧
+    // 流式帧：数连续合格帧，够了就进入选帧（不是立刻拍）
     okStreak = m.ok ? okStreak + 1 : 0;
-    if (okStreak >= captureAfter() && !capturing) sendCapture();
+    if (!m.ok){
+      resetPick();                         // 证件动了/脱框了：候选作废，重新数
+    } else if (okStreak >= captureAfter() && !picking && !capturing){
+      picking = true; picked = 0; bestScore = -1;
+    }
   }
   $('sStreak').textContent = okStreak + '/' + captureAfter()
+      + (picking ? '  选帧 ' + picked + '/' + pickFrames() : '')
       + (capturing ? '  高清帧上传中' : '');
 
   if (!capturing && !m.capture){
-    banner(m.msg + (okStreak ? '  ' + okStreak + '/' + captureAfter() : ''),
-           m.ok ? 'ok' : (m.reason === 'unstable' ? 'wait' : 'bad'));
+    if (picking){
+      banner('保持不动，正在挑最清晰的一帧…', 'wait');
+    } else {
+      banner(m.msg + (okStreak ? '  ' + okStreak + '/' + captureAfter() : ''),
+             m.ok ? 'ok' : (m.reason === 'unstable' ? 'wait' : 'bad'));
+    }
   }
 
   if (m.ok && m.image){
@@ -553,11 +588,89 @@ function grabAt(longSide, q){
 }
 function grab(){ return grabAt(STREAM_LONG, STREAM_Q); }
 
-/* 连续 captureAfter() 帧合格后，自动补传一张高清帧出最终裁图。
+/* ---------------- 选帧：Tenengrad 清晰度 ----------------
+
+   Tenengrad = Sobel 梯度平方的均值。散焦和运动模糊都会把边缘抹平，
+   梯度随之变小，所以分数越高越清晰。相比拉普拉斯方差，它对噪点没那么敏感
+   （服务端人脸那道 blurry 闸门用的是拉普拉斯，那边是绝对阈值、需要另一种标定；
+   这里只在同一场景的几帧之间【比大小】，不需要绝对阈值，也就不必两边一致）。 */
+
+/* 给当前帧打分：取目标中心的一块原尺寸像素，算 Tenengrad */
+function sharpness(){
+  const vw = v.videoWidth, vh = v.videoHeight;
+  if (!vw) return 0;
+
+  // 定位：证件用四角中心，人脸用检测框中心。都是上传帧（416 长边）的坐标系，
+  // 按比例映射回视频原始像素。没有结果就退化成画面中心。
+  let cx = vw / 2, cy = vh / 2;
+  const fs = last && last.frame_size;
+  if (fs && fs[0]){
+    const sx = vw / fs[0], sy = vh / fs[1];
+    const q = last.quad, b = last.box;
+    if (q && q.length === 4){
+      cx = (q[0][0] + q[1][0] + q[2][0] + q[3][0]) / 4 * sx;
+      cy = (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4 * sy;
+    } else if (b && b.length === 4){
+      cx = (b[0] + b[2] / 2) * sx;
+      cy = (b[1] + b[3] / 2) * sy;
+    }
+  }
+  const n = Math.min(SHARP_PATCH, vw, vh);
+  const x = Math.max(0, Math.min(vw - n, Math.round(cx - n / 2)));
+  const y = Math.max(0, Math.min(vh - n, Math.round(cy - n / 2)));
+
+  shC.width = n; shC.height = n;
+  shctx.drawImage(v, x, y, n, n, 0, 0, n, n);      // 1:1，不缩放
+  const d = shctx.getImageData(0, 0, n, n).data;
+
+  // 先转灰度：整型权重 (77,150,29)/256 ≈ BT.601，比浮点快
+  const g = new Uint8Array(n * n);
+  for (let i = 0, p = 0; i < g.length; i++, p += 4){
+    g[i] = (d[p] * 77 + d[p+1] * 150 + d[p+2] * 29) >> 8;
+  }
+  let sum = 0;
+  for (let yy = 1; yy < n - 1; yy++){
+    const r0 = (yy-1)*n, r1 = yy*n, r2 = (yy+1)*n;
+    for (let xx = 1; xx < n - 1; xx++){
+      const gx = -g[r0+xx-1] - 2*g[r1+xx-1] - g[r2+xx-1]
+               +  g[r0+xx+1] + 2*g[r1+xx+1] + g[r2+xx+1];
+      const gy = -g[r0+xx-1] - 2*g[r0+xx] - g[r0+xx+1]
+               +  g[r2+xx-1] + 2*g[r2+xx] + g[r2+xx+1];
+      sum += gx*gx + gy*gy;
+    }
+  }
+  return sum / ((n-2) * (n-2));
+}
+
+/* 把当前帧按高清尺寸存进 bestC，作为目前的最佳候选 */
+function snapBest(){
+  const vw = v.videoWidth, vh = v.videoHeight;
+  const s = CAP_LONG / Math.max(vw, vh);
+  bestC.width  = Math.round(vw * s);
+  bestC.height = Math.round(vh * s);
+  bctx.drawImage(v, 0, 0, bestC.width, bestC.height);
+}
+
+/* 每个推流周期评估一帧。必须【同步】跑完评分和存帧，中间不能 await ——
+   否则视频已经翻到下一帧，存下来的就不是打分的那一帧了。 */
+function pickStep(){
+  const s = sharpness();
+  picked++;
+  if (s > bestScore){ bestScore = s; snapBest(); }
+  if (picked >= pickFrames()){
+    picking = false;
+    sendCapture();
+  }
+}
+
+function resetPick(){ picking = false; picked = 0; bestScore = -1; }
+
+/* 选帧结束后，把最清晰的那一帧作为高清帧上传，出最终裁图。
    先发 {"type":"capture"} 告诉服务端"下一个二进制帧按高清处理"，
    服务端对这一帧走无状态严格判定，通不过不会闭锁、可以继续重试。 */
 async function sendCapture(){
   if (!ws || ws.readyState !== 1 || capturing) return;
+  if (bestScore < 0) return;              // 没有候选帧（刚 reset 过），等下一轮
   capturing = true;
   // 体积上限：证件细纹/防伪底纹很多，同样质量下比普通照片大不少
   // （真机实测 q92 到过 177KB；细节极端的图 q82 还能到 240KB，
@@ -566,7 +679,7 @@ async function sendCapture(){
   // 只降质量不降分辨率：分辨率直接决定最终裁图的清晰度，代价更大。
   let blob = null;
   for (let q = CAP_Q; q >= 0.5; q -= 0.12){
-    blob = await grabAt(CAP_LONG, q);
+    blob = await new Promise(r => bestC.toBlob(r, 'image/jpeg', q));
     if (!blob || blob.size / 1024 <= CAP_MAX_KB) break;
   }
   if (!blob){ capturing = false; return; }
@@ -577,6 +690,12 @@ async function sendCapture(){
 
 async function tick(){
   if (!ws || ws.readyState !== 1) return;
+
+  // 选帧和推流用同一帧、同一个 10fps 节拍。放在背压判断【之前】：打分是纯本地
+  // 计算，不占上行，上行堵住时更不该让选帧跟着停住（否则网络一差就永远拍不成）。
+  // 必须同步跑完（pickStep 内部不 await），否则视频已经翻到下一帧，
+  // 存下来的就不是打分的那一帧了。
+  if (picking && !capturing) pickStep();
 
   // 连续发送，不等上一帧的结果。
   //
@@ -624,7 +743,8 @@ async function start(){
       return;
     }
   }
-  sent = 0; got = 0; dropped = 0; okStreak = 0; capturing = false; t0 = performance.now();
+  sent = 0; got = 0; dropped = 0; okStreak = 0; capturing = false; resetPick();
+  t0 = performance.now();
   clearInterval(timer);
   timer = setInterval(tick, 1000/FPS);
 }
@@ -639,7 +759,8 @@ $('btnAgain').onclick = () => {
   $('btnAgain').style.display = 'none';
   $('btnStart').style.display = '';
   $('shot').style.display = 'none'; $('empty').style.display = 'block';
-  last = null; okStreak = 0; capturing = false; ctx.clearRect(0,0,viewW,viewH);
+  last = null; okStreak = 0; capturing = false; resetPick();
+  ctx.clearRect(0,0,viewW,viewH);
   start();
 };
 $('btnCam').onclick   = async () => {
@@ -677,7 +798,7 @@ function setMode(m){
   $('sMode').textContent = m;
   $('shot').style.display='none'; $('empty').style.display='block';
   $('btnAgain').style.display='none'; $('btnStart').style.display='';   // 换模式=重开一次抓拍
-  last = null; okStreak = 0; capturing = false;
+  last = null; okStreak = 0; capturing = false; resetPick();
   ctx.clearRect(0,0,viewW,viewH);
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'config', mode:m}));
   // 证件用后置、人脸用前置，更符合实际使用。
