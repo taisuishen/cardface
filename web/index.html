@@ -126,15 +126,15 @@ const CAP_MAX_KB  = 90;           // 高清帧体积上限，超了自动降质�
 const CAPTURE_AFTER_BY_MODE = { card: 3, face: 1 };
 function captureAfter(){ return CAPTURE_AFTER_BY_MODE[mode] || 1; }
 
-// 凑够连续合格帧后【不立刻拍】，而是再看 PICK_FRAMES 帧，本地算清晰度，
-// 挑最清晰的那一帧上传。
+// 从【第 1 个合格帧】起就逐帧算清晰度、记住最清晰的那一张；数到第
+// captureAfter() 个合格帧时，把已经挑好的那张直接传上去。
 //
 // 为什么要挑：姿态合格 ≠ 这一帧清晰。手持时手机一直在微动，10fps 下相邻帧的
 // 清晰度能差出好几倍（对焦呼吸、快门期间的位移）。服务端只对上传的那一张做
 // 判定，抓到糊的那张就直接影响 OCR，而且它自己看不出"下一帧其实更清楚"。
-// 代价：多等 PICK_FRAMES 帧。10fps 下 5 帧 = 500ms，推流不停，用户无感。
-const PICK_FRAMES_BY_MODE = { card: 5, face: 3 };
-function pickFrames(){ return PICK_FRAMES_BY_MODE[mode] || 3; }
+//
+// 选帧窗口 = 第 1 个到第 3 个合格帧之间，10fps 下天然就有 3 帧上下的候选，
+// 【一帧都不多等】—— 攒够合格帧的那一刻就发，和不选帧时一样快。
 
 // 清晰度用 Tenengrad（Sobel 梯度平方均值）：越清晰边缘越陡，梯度越大。
 // 只在【原始像素】的一小块上算，不缩放 —— 缩放本身就是低通滤波，会把
@@ -165,7 +165,7 @@ let mode = 'card', facing = 'environment', deviceId = '';   // deviceId 为空 =
 let sent = 0, got = 0, dropped = 0, lastSentAt = 0, capSentAt = 0, lastCloseCode = 0;
 let okStreak = 0;        // 连续合格帧数，达到 CAPTURE_AFTER 就进入选帧
 let capturing = false;   // 高清帧在途，期间暂停推流
-let picking = false;     // 正在选帧：继续推流，同时逐帧算清晰度
+let picking = false;     // 正在攒候选：第 1 个合格帧起，逐帧算清晰度留最好的
 let picked = 0;          // 已评估的候选帧数
 let bestScore = -1;      // 目前最高的 Tenengrad 分数（-1 = 还没有候选）
 let zoomApplied = null;  // 实际生效的 zoom 倍数（不支持 zoom 约束则为 null）
@@ -502,25 +502,25 @@ function onMsg(m){
       banner('高清帧未通过（' + m.msg + '），继续对准…', 'bad');
     }
   } else {
-    // 流式帧：数连续合格帧，够了就进入选帧（不是立刻拍）
+    // 流式帧：数连续合格帧。第 1 个合格帧就开始攒候选，够数了立刻发最清晰的那张。
     okStreak = m.ok ? okStreak + 1 : 0;
     if (!m.ok){
       resetPick();                         // 证件动了/脱框了：候选作废，重新数
-    } else if (okStreak >= captureAfter() && !picking && !capturing){
-      picking = true; picked = 0; bestScore = -1;
+    } else {
+      if (!picking && !capturing){ picking = true; picked = 0; bestScore = -1; }
+      if (okStreak >= captureAfter() && !capturing){
+        picking = false;
+        sendCapture();
+      }
     }
   }
   $('sStreak').textContent = okStreak + '/' + captureAfter()
-      + (picking ? '  选帧 ' + picked + '/' + pickFrames() : '')
+      + (picking ? '  候选 ' + picked : '')
       + (capturing ? '  高清帧上传中' : '');
 
   if (!capturing && !m.capture){
-    if (picking){
-      banner('保持不动，正在挑最清晰的一帧…', 'wait');
-    } else {
-      banner(m.msg + (okStreak ? '  ' + okStreak + '/' + captureAfter() : ''),
-             m.ok ? 'ok' : (m.reason === 'unstable' ? 'wait' : 'bad'));
-    }
+    banner(m.msg + (okStreak ? '  ' + okStreak + '/' + captureAfter() : ''),
+           m.ok ? 'ok' : (m.reason === 'unstable' ? 'wait' : 'bad'));
   }
 
   if (m.ok && m.image){
@@ -651,26 +651,26 @@ function snapBest(){
   bctx.drawImage(v, 0, 0, bestC.width, bestC.height);
 }
 
-/* 每个推流周期评估一帧。必须【同步】跑完评分和存帧，中间不能 await ——
-   否则视频已经翻到下一帧，存下来的就不是打分的那一帧了。 */
+/* 每个推流周期评估一帧，比目前最好的还清晰就替换掉。
+   必须【同步】跑完评分和存帧，中间不能 await —— 否则视频已经翻到下一帧，
+   存下来的就不是打分的那一帧了。
+   什么时候停由 onMsg 决定（攒够合格帧就发），这里不管。 */
 function pickStep(){
   const s = sharpness();
   picked++;
   if (s > bestScore){ bestScore = s; snapBest(); }
-  if (picked >= pickFrames()){
-    picking = false;
-    sendCapture();
-  }
 }
 
 function resetPick(){ picking = false; picked = 0; bestScore = -1; }
 
-/* 选帧结束后，把最清晰的那一帧作为高清帧上传，出最终裁图。
+/* 攒够合格帧后，把窗口里最清晰的那一帧作为高清帧上传，出最终裁图。
    先发 {"type":"capture"} 告诉服务端"下一个二进制帧按高清处理"，
    服务端对这一帧走无状态严格判定，通不过不会闭锁、可以继续重试。 */
 async function sendCapture(){
   if (!ws || ws.readyState !== 1 || capturing) return;
-  if (bestScore < 0) return;              // 没有候选帧（刚 reset 过），等下一轮
+  // 一个候选都没攒到就直接用当前帧（人脸模式 captureAfter=1 本来就没有窗口；
+  // 证件模式则是几个合格回执挤在同一个 tick 间隔里到达，来不及打分）。
+  if (bestScore < 0) snapBest();
   capturing = true;
   // 体积上限：证件细纹/防伪底纹很多，同样质量下比普通照片大不少
   // （真机实测 q92 到过 177KB；细节极端的图 q82 还能到 240KB，
@@ -692,7 +692,8 @@ async function tick(){
   if (!ws || ws.readyState !== 1) return;
 
   // 选帧和推流用同一帧、同一个 10fps 节拍。放在背压判断【之前】：打分是纯本地
-  // 计算，不占上行，上行堵住时更不该让选帧跟着停住（否则网络一差就永远拍不成）。
+  // 计算，不占上行，上行堵住时更不该跟着停 —— 否则网络一差就攒不到候选，
+  // 到该拍的那一刻只能退回"抓当前帧"。
   // 必须同步跑完（pickStep 内部不 await），否则视频已经翻到下一帧，
   // 存下来的就不是打分的那一帧了。
   if (picking && !capturing) pickStep();
